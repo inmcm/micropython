@@ -104,21 +104,37 @@
 //*****************************************************************************
 // Register Access and Updates
 //
-// Tick of SCC has a resolution of 32768Hz. Therefore, scaling SCC value by 32
-// yields ~1 msec resolution. All operations of SCC in RTC context use ms unit.
-//*****************************************************************************
-#define SCC_U64MSEC_GET()                (MAP_PRCMSlowClkCtrGet() >> 5)
+// Tick of SCC has a resolution of 32768Hz, meaning 1 sec is equal to 32768
+// clock ticks. Ideal way of getting time in millisecond will involve floating
+// point arithmetic (division by 32.768). To avoid this, we simply divide it by
+// 32, which will give a range from 0 -1023(instead of 0-999). To use this
+// output correctly we have to take care of this inaccuracy externally.
+// following wrapper can be used to convert the value from cycles to
+// millisecond:
+//
+// CYCLES_U16MS(cycles) ((cycles * 1000) / 1024),
+//
+// Similarly, before setting the value, it must be first converted (from ms to
+// cycles).
+//
+// U16MS_CYCLES(msec)   ((msec * 1024) / 1000)
+//
+// Note: There is a precision loss of 1 ms with the above scheme.
+//
+//
+#define SCC_U64MSEC_GET()                (RTCFastDomainCounterGet() >> 5)
 #define SCC_U64MSEC_MATCH_SET(u64Msec)   (MAP_PRCMSlowClkCtrMatchSet(u64Msec << 5))
 #define SCC_U64MSEC_MATCH_GET()          (MAP_PRCMSlowClkCtrMatchGet() >> 5)
 
 //*****************************************************************************
 //
 // Bit:  31 is used to indicate use of RTC. If set as '1', RTC feature is used.
-// Bit:  30 is used to indicate that a safe boot should be performed
-// bit:  29 is used to indicate that the last reset was caused by the WDT
-// Bits: 28 to 26 are unused
+// Bit:  30 is used to indicate that a safe boot should be performed.
+// bit:  29 is used to indicate that the last reset was caused by the WDT.
+// bit:  28 is used to indicate that the board is booting for the first time after being programmed in factory.
+// Bits: 27 and 26 are unused.
 // Bits: 25 to 16 are used to save millisecond part of RTC reference.
-// Bits: 15 to 0 are being used for HW Changes / ECO
+// Bits: 15 to 0 are being used for HW Changes / ECO.
 //
 //*****************************************************************************
 
@@ -127,11 +143,11 @@
 //*****************************************************************************
 static void RTCUseSet(void)
 {
-  unsigned short usRegValue;
+  unsigned int uiRegValue;
 
-  usRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) | (1 << 31);
+  uiRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) | (1 << 31);
 
-  PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, usRegValue);
+  PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, uiRegValue);
 }
 
 //*****************************************************************************
@@ -139,11 +155,11 @@ static void RTCUseSet(void)
 //*****************************************************************************
 static void RTCUseClear(void)
 {
-  unsigned short usRegValue;
+  unsigned int uiRegValue;
 
-  usRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (~(1 << 31));
+  uiRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (~(1 << 31));
 
-  PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, usRegValue);
+  PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, uiRegValue);
 }
 
 //*****************************************************************************
@@ -157,7 +173,7 @@ static tBoolean IsRTCUsed(void)
 //*****************************************************************************
 // Read 16-bit mSecs
 //*****************************************************************************
-static unsigned short RTCU16MSecRegRead(void)
+static unsigned short RTCU32MSecRegRead(void)
 {
   return ((MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) >> 16) & 0x03FF);
 }
@@ -165,15 +181,15 @@ static unsigned short RTCU16MSecRegRead(void)
 //*****************************************************************************
 // Write 16-bit mSecs
 //*****************************************************************************
-static void RTCU16MSecRegWrite(unsigned short u16Msec)
+static void RTCU32MSecRegWrite(unsigned int u32Msec)
 {
-   unsigned short usRegValue;
+   unsigned int uiRegValue;
 
    // read the whole register and clear the msec bits
-   usRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (~(0x03FF << 16));
+   uiRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (~(0x03FF << 16));
 
    // write the msec bits only
-   MAP_PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, usRegValue | ((u16Msec & 0x03FF) << 16));
+   MAP_PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, uiRegValue | ((u32Msec & 0x03FF) << 16));
 }
 
 //*****************************************************************************
@@ -193,14 +209,47 @@ static void RTCU32SecRegWrite(unsigned long u32Msec)
 }
 
 //*****************************************************************************
+// Fast function to get the most accurate RTC counter value
+//*****************************************************************************
+static unsigned long long RTCFastDomainCounterGet (void) {
+
+    #define BRK_IF_RTC_CTRS_ALIGN(c2, c1)       if (c2 - c1 <= 1) {     \
+                                                    itr++;              \
+                                                    break;              \
+                                                }
+
+    unsigned long long rtc_count1, rtc_count2, rtc_count3;
+    unsigned int itr;
+
+    do {
+        rtc_count1 = PRCMSlowClkCtrFastGet();
+        rtc_count2 = PRCMSlowClkCtrFastGet();
+        rtc_count3 = PRCMSlowClkCtrFastGet();
+        itr = 0;
+
+        BRK_IF_RTC_CTRS_ALIGN(rtc_count2, rtc_count1);
+        BRK_IF_RTC_CTRS_ALIGN(rtc_count3, rtc_count2);
+        BRK_IF_RTC_CTRS_ALIGN(rtc_count3, rtc_count1);
+
+        // Consistent values in two consecutive reads implies a correct
+        // value of the counter. Do note, the counter does not give the
+        // calendar time but a hardware that ticks upwards continuously.
+        // The 48-bit counter operates at 32,768 HZ.
+
+    } while (true);
+
+    return (1 == itr) ? rtc_count2 : rtc_count3;
+}
+
+//*****************************************************************************
 // Macros
 //*****************************************************************************
 #define IS_RTC_USED()                   IsRTCUsed()
 #define RTC_USE_SET()                   RTCUseSet()
 #define RTC_USE_CLR()                   RTCUseClear()
 
-#define RTC_U16MSEC_REG_RD()            RTCU16MSecRegRead()
-#define RTC_U16MSEC_REG_WR(u16Msec)     RTCU16MSecRegWrite(u16Msec)
+#define RTC_U32MSEC_REG_RD()            RTCU32MSecRegRead()
+#define RTC_U32MSEC_REG_WR(u32Msec)     RTCU32MSecRegWrite(u32Msec)
 
 #define RTC_U32SECS_REG_RD()            RTCU32SecRegRead()
 #define RTC_U32SECS_REG_WR(u32Secs)     RTCU32SecRegWrite(u32Secs)
@@ -239,94 +288,49 @@ static const PRCM_PeriphRegs_t PRCM_PeriphRegsList[] =
 
 //*****************************************************************************
 //
-//! Requests a safe boot
+//! Set a special bit
 //!
 //! \return None.
 //
 //*****************************************************************************
-void PRCMRequestSafeBoot(void)
+void PRCMSetSpecialBit(unsigned char bit)
 {
-    unsigned short usRegValue;
+    unsigned int uiRegValue;
 
-    usRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) | (1 << 30);
+    uiRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) | (1 << bit);
 
-    PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, usRegValue);
+    PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, uiRegValue);
 }
 
 //*****************************************************************************
 //
-//! Clear the safe boot request
+//! Clear a special bit
 //!
 //! \return None.
 //
 //*****************************************************************************
-void PRCMClearSafeBootRequest(void)
+void PRCMClearSpecialBit(unsigned char bit)
 {
-    unsigned short usRegValue;
+    unsigned int uiRegValue;
 
-    usRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (~(1 << 30));
+    uiRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (~(1 << bit));
 
-    PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, usRegValue);
+    PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, uiRegValue);
 }
 
 //*****************************************************************************
 //
-//! Read the safe boot request bit. This bit is cleared after reading.
+//! Read a special bit
 //!
-//! \return Value of the safe boot bit
+//! \return Value of the bit
 //
 //*****************************************************************************
-tBoolean PRCMIsSafeBootRequested(void)
+tBoolean PRCMGetSpecialBit(unsigned char bit)
 {
-    tBoolean safeboot =  (MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (1 << 30)) ? true : false;
-
-    PRCMClearSafeBootRequest();
-
-    return safeboot;
-}
-
-//*****************************************************************************
-//
-//! Signals that a WDT reset has occurred
-//!
-//! \return None.
-//
-//*****************************************************************************
-void PRCMSignalWDTReset(void)
-{
-    unsigned short usRegValue;
-
-    usRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) | (1 << 29);
-
-    PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, usRegValue);
-}
-
-//*****************************************************************************
-//
-//! Clear the WDT reset signal
-//!
-//! \return None.
-//
-//*****************************************************************************
-void PRCMClearWDTResetSignal(void)
-{
-    unsigned short usRegValue;
-
-    usRegValue = MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (~(1 << 29));
-
-    PRCMHIBRegWrite(RTC_MSEC_U32_REG_ADDR, usRegValue);
-}
-
-//*****************************************************************************
-//
-//! Read the WDT reset signal bit
-//!
-//! \return Value of the WDT reset signal bit
-//
-//*****************************************************************************
-tBoolean PRCMWasResetBecauseOfWDT(void)
-{
-    return (MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (1 << 29)) ? true : false;
+    tBoolean value = (MAP_PRCMHIBRegRead(RTC_MSEC_U32_REG_ADDR) & (1 << bit)) ? true : false;
+    // special bits must be cleared immediatelly after reading
+    PRCMClearSpecialBit(bit);
+    return value;
 }
 
 //*****************************************************************************
@@ -683,14 +687,24 @@ void PRCMLPDSRestoreInfoSet(unsigned long ulStackPtr, unsigned long ulProgCntr)
 //! \sa PRCMLPDSRestoreInfoSet().
 //!
 //! \return None.
+//!
+//! \note The Test Power Domain is shutdown whenever the system
+//!  enters LPDS (by default). In order to avoid this and allow for
+//!  connecting back the debugger after waking up from LPDS,
+//!  the macro KEEP_TESTPD_ALIVE has to be defined while building the library.
+//!  This is recommended for development purposes only as it adds to
+//!  the current consumption of the system.
+//!
 //
 //*****************************************************************************
 void PRCMLPDSEnter(void)
 {
+#ifndef DEBUG
   //
   // Disable TestPD
   //
   HWREG(0x4402E168) |= (1<<9);
+#endif
 
   //
   // Set bandgap duty cycle to 1
@@ -700,8 +714,7 @@ void PRCMLPDSEnter(void)
   //
   // Request LPDS
   //
-  HWREG(ARCM_BASE + APPS_RCM_O_APPS_LPDS_REQ)
-          = APPS_RCM_APPS_LPDS_REQ_APPS_LPDS_REQ;
+  HWREG(ARCM_BASE + APPS_RCM_O_APPS_LPDS_REQ) = APPS_RCM_APPS_LPDS_REQ_APPS_LPDS_REQ;
 
   __asm("    nop\n"
         "    nop\n"
@@ -1265,6 +1278,35 @@ unsigned long long PRCMSlowClkCtrGet(void)
   return ullRTCVal;
 }
 
+//*****************************************************************************
+//
+//! Gets the current value of the internal slow clock counter
+//!
+//! This function is similar to \sa PRCMSlowClkCtrGet() but reads the counter
+//! value from a relatively faster interface using an auto-latch mechainsm.
+//!
+//! \note Due to the nature of implemetation of auto latching, when using this
+//! API, the recommendation is to read the value thrice and identify the right
+//! value (as 2 out the 3 read values will always be correct and with a max. of
+//! 1 LSB change)
+//!
+//! \return 64-bit current counter vlaue.
+//
+//*****************************************************************************
+unsigned long long PRCMSlowClkCtrFastGet(void)
+{
+  unsigned long long ullRTCVal;
+
+  //
+  // Read as 2 32-bit values
+  //
+  ullRTCVal = HWREG(HIB1P2_BASE + HIB1P2_O_HIB_RTC_TIMER_MSW_1P2);
+  ullRTCVal = ullRTCVal << 32;
+  ullRTCVal |= HWREG(HIB1P2_BASE + HIB1P2_O_HIB_RTC_TIMER_LSW_1P2);
+
+  return ullRTCVal;
+
+}
 
 //*****************************************************************************
 //
@@ -1574,7 +1616,7 @@ void PRCMRTCSet(unsigned long ulSecs, unsigned short usMsec)
                 ullMsec = RTC_U64MSEC_MK(ulSecs, usMsec) - SCC_U64MSEC_GET();
 
                  RTC_U32SECS_REG_WR(RTC_SECS_IN_U64MSEC(ullMsec));
-                 RTC_U16MSEC_REG_WR(RTC_MSEC_IN_U64MSEC(ullMsec));
+                 RTC_U32MSEC_REG_WR(RTC_MSEC_IN_U64MSEC(ullMsec));
         }
 
         return;
@@ -1605,7 +1647,7 @@ void PRCMRTCGet(unsigned long *ulSecs, unsigned short *usMsec)
 
         if(IS_RTC_USED()) {
                 ullMsec  = RTC_U64MSEC_MK(RTC_U32SECS_REG_RD(),
-                                          RTC_U16MSEC_REG_RD());
+                                          RTC_U32MSEC_REG_RD());
                 ullMsec += SCC_U64MSEC_GET();
         }
 
@@ -1641,7 +1683,7 @@ void PRCMRTCMatchSet(unsigned long ulSecs, unsigned short usMsec)
         if(IS_RTC_USED()) {
                 ullMsec  = RTC_U64MSEC_MK(ulSecs, usMsec);
                 ullMsec -= RTC_U64MSEC_MK(RTC_U32SECS_REG_RD(),
-                                          RTC_U16MSEC_REG_RD());
+                                          RTC_U32MSEC_REG_RD());
                 SCC_U64MSEC_MATCH_SET(SELECT_SCC_U42BITS(ullMsec));
         }
 
@@ -1674,7 +1716,7 @@ void PRCMRTCMatchGet(unsigned long *ulSecs, unsigned short *usMsec)
         if(IS_RTC_USED()) {
                 ullMsec  = SCC_U64MSEC_MATCH_GET();
                 ullMsec += RTC_U64MSEC_MK(RTC_U32SECS_REG_RD(),
-                                          RTC_U16MSEC_REG_RD());
+                                          RTC_U32MSEC_REG_RD());
         }
 
         *ulSecs = RTC_SECS_IN_U64MSEC(ullMsec);
@@ -1844,6 +1886,63 @@ void PRCMHIBRegWrite(unsigned long ulRegAddr, unsigned long ulValue)
   // Wait for 200 uSec
   //
   UtilsDelay((80*200)/3);
+}
+
+//*****************************************************************************
+//
+//! \param ulDivider is clock frequency divider value
+//! \param ulWidth is the width of the high pulse
+//!
+//! This function sets the input frequency for camera module.
+//!
+//! The frequency is calculated as follows:
+//!
+//!        f_out = 240MHz/ulDivider;
+//!
+//! The parameter \e ulWidth sets the width of the high pulse.
+//!
+//! For e.g.:
+//!
+//!     ulDivider = 4;
+//!     ulWidth   = 2;
+//!
+//!     f_out = 30 MHz and 50% duty cycle
+//!
+//! And,
+//!
+//!     ulDivider = 4;
+//!     ulWidth   = 1;
+//!
+//!     f_out = 30 MHz and 25% duty cycle
+//!
+//! \return 0 on success, 1 on error
+//
+//*****************************************************************************
+unsigned long PRCMCameraFreqSet(unsigned char ulDivider, unsigned char ulWidth)
+{
+    if(ulDivider > ulWidth && ulWidth != 0 )
+    {
+      //
+      // Set  the hifh pulse width
+      //
+      HWREG(ARCM_BASE +
+            APPS_RCM_O_CAMERA_CLK_GEN) = (((ulWidth & 0x07) -1) << 8);
+
+      //
+      // Set the low pulse width
+      //
+      HWREG(ARCM_BASE +
+            APPS_RCM_O_CAMERA_CLK_GEN) = ((ulDivider - ulWidth - 1) & 0x07);
+      //
+      // Return success
+      //
+      return 0;
+    }
+
+    //
+    // Success;
+    //
+    return 1;
 }
 
 //*****************************************************************************

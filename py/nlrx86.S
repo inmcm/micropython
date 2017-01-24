@@ -35,11 +35,24 @@
 // the offset of nlr_top within mp_state_ctx_t
 #define NLR_TOP_OFFSET (2 * 4)
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__CYGWIN__)
+#define NLR_OS_WINDOWS
+#endif
+
+#if defined(__APPLE__) && defined(__MACH__)
+#define NLR_OS_MAC
+#endif
+
+#if defined(NLR_OS_WINDOWS) || defined(NLR_OS_MAC)
 #define NLR_TOP (_mp_state_ctx + NLR_TOP_OFFSET)
+#define MP_THREAD_GET_STATE _mp_thread_get_state
 #else
 #define NLR_TOP (mp_state_ctx + NLR_TOP_OFFSET)
+#define MP_THREAD_GET_STATE mp_thread_get_state
 #endif
+
+// offset of nlr_top within mp_state_thread_t structure
+#define NLR_TOP_TH_OFF (0)
 
     .file   "nlr.s"
     .text
@@ -47,9 +60,12 @@
 /**************************************/
 // mp_uint_t nlr_push(4(%esp)=nlr_buf_t *nlr)
 
-#ifdef _WIN32
+#if defined(NLR_OS_WINDOWS)
     .globl  _nlr_push
     .def    _nlr_push; .scl 2; .type 32; .endef
+_nlr_push:
+#elif defined(NLR_OS_MAC)
+    .globl  _nlr_push
 _nlr_push:
 #else
     .globl  nlr_push
@@ -64,50 +80,78 @@ nlr_push:
     mov     %ebx, 20(%edx)          # store %bx into nlr_buf+20
     mov     %edi, 24(%edx)          # store %di into nlr_buf
     mov     %esi, 28(%edx)          # store %si into nlr_buf
+
+#if !MICROPY_PY_THREAD
     mov     NLR_TOP, %eax           # load nlr_top
     mov     %eax, (%edx)            # store it
     mov     %edx, NLR_TOP           # stor new nlr_buf (to make linked list)
+#else
+    // to check: stack is aligned to 16-byte boundary before this call
+    call    MP_THREAD_GET_STATE     # get mp_state_thread ptr into eax
+    mov     4(%esp), %edx           # load nlr_buf argument into edx (edx clobbered by call)
+    mov     NLR_TOP_TH_OFF(%eax), %ecx # get thread.nlr_top (last nlr_buf)
+    mov     %ecx, (%edx)            # store it
+    mov     %edx, NLR_TOP_TH_OFF(%eax) # store new nlr_buf (to make linked list)
+#endif
+
     xor     %eax, %eax              # return 0, normal return
     ret                             # return
-#ifndef _WIN32
+#if !defined(NLR_OS_WINDOWS) && !defined(NLR_OS_MAC)
     .size   nlr_push, .-nlr_push
 #endif
 
 /**************************************/
 // void nlr_pop()
 
-#ifdef _WIN32
+#if defined(NLR_OS_WINDOWS)
     .globl  _nlr_pop
     .def    _nlr_pop; .scl 2; .type 32; .endef
+_nlr_pop:
+#elif defined(NLR_OS_MAC)
+    .globl  _nlr_pop
 _nlr_pop:
 #else
     .globl  nlr_pop
     .type   nlr_pop, @function
 nlr_pop:
 #endif
+
+#if !MICROPY_PY_THREAD
     mov     NLR_TOP, %eax           # load nlr_top
     mov     (%eax), %eax            # load prev nlr_buf
     mov     %eax, NLR_TOP           # store nlr_top (to unlink list)
+#else
+    call    MP_THREAD_GET_STATE     # get mp_state_thread ptr into eax
+    mov     NLR_TOP_TH_OFF(%eax), %ecx # get thread.nlr_top (last nlr_buf)
+    mov     (%ecx), %ecx            # load prev nlr_buf
+    mov     %ecx, NLR_TOP_TH_OFF(%eax) # store prev nlr_buf (to unlink list)
+#endif
+
     ret                             # return
-#ifndef _WIN32
+#if !defined(NLR_OS_WINDOWS) && !defined(NLR_OS_MAC)
     .size   nlr_pop, .-nlr_pop
 #endif
 
 /**************************************/
 // void nlr_jump(4(%esp)=mp_uint_t val)
 
-#ifdef _WIN32
+#if defined(NLR_OS_WINDOWS)
     .globl  _nlr_jump
     .def    _nlr_jump; .scl 2; .type 32; .endef
+_nlr_jump:
+#elif defined(NLR_OS_MAC)
+    .globl  _nlr_jump
 _nlr_jump:
 #else
     .globl  nlr_jump
     .type   nlr_jump, @function
 nlr_jump:
 #endif
+
+#if !MICROPY_PY_THREAD
     mov     NLR_TOP, %edx           # load nlr_top
     test    %edx, %edx              # check for nlr_top being NULL
-#ifdef _WIN32
+#if defined(NLR_OS_WINDOWS) || defined(NLR_OS_MAC)
     je      _nlr_jump_fail           # fail if nlr_top is NULL
 #else
     je      nlr_jump_fail           # fail if nlr_top is NULL
@@ -116,6 +160,21 @@ nlr_jump:
     mov     %eax, 4(%edx)           # store return value
     mov     (%edx), %eax            # load prev nlr_top
     mov     %eax, NLR_TOP           # store nlr_top (to unlink list)
+#else
+    call    MP_THREAD_GET_STATE     # get mp_state_thread ptr into eax
+    mov     NLR_TOP_TH_OFF(%eax), %edx # get thread.nlr_top (last nlr_buf)
+    test    %edx, %edx              # check for nlr_top being NULL
+#if defined(NLR_OS_WINDOWS) || defined(NLR_OS_MAC)
+    je      _nlr_jump_fail          # fail if nlr_top is NULL
+#else
+    je      nlr_jump_fail           # fail if nlr_top is NULL
+#endif
+    mov     4(%esp), %ecx           # load return value
+    mov     %ecx, 4(%edx)           # store return value
+    mov     (%edx), %ecx            # load prev nlr_top
+    mov     %ecx, NLR_TOP_TH_OFF(%eax) # store nlr_top (to unlink list)
+#endif
+
     mov     28(%edx), %esi          # load saved %si
     mov     24(%edx), %edi          # load saved %di
     mov     20(%edx), %ebx          # load saved %bx
@@ -126,7 +185,7 @@ nlr_jump:
     xor     %eax, %eax              # clear return register
     inc     %al                     # increase to make 1, non-local return
     ret                             # return
-#ifndef _WIN32
+#if !defined(NLR_OS_WINDOWS) && !defined(NLR_OS_MAC)
     .size   nlr_jump, .-nlr_jump
 #endif
 

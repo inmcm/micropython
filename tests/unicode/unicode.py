@@ -16,3 +16,20 @@ for i in range(-len(s), len(s)):
 # Test UTF-8 encode and decode
 enc = s.encode()
 print(enc, enc.decode() == s)
+
+# printing of unicode chars using repr
+# NOTE: for some characters (eg \u10ff) we differ to CPython
+print(repr('a\uffff'))
+print(repr('a\U0001ffff'))
+
+# test invalid escape code
+try:
+    eval('"\\U00110000"')
+except SyntaxError:
+    print('SyntaxError')
+
+# test unicode string given to int
+try:
+    int('\u0200')
+except ValueError:
+    print('ValueError')

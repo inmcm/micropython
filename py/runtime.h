@@ -48,11 +48,12 @@ typedef union _mp_arg_val_t {
     bool u_bool;
     mp_int_t u_int;
     mp_obj_t u_obj;
+    mp_rom_obj_t u_rom_obj;
 } mp_arg_val_t;
 
 typedef struct _mp_arg_t {
-    qstr qst;
-    mp_uint_t flags;
+    uint16_t qst;
+    uint16_t flags;
     mp_arg_val_t defval;
 } mp_arg_t;
 
@@ -63,9 +64,12 @@ extern const qstr mp_binary_op_method_name[];
 void mp_init(void);
 void mp_deinit(void);
 
-void mp_arg_check_num(mp_uint_t n_args, mp_uint_t n_kw, mp_uint_t n_args_min, mp_uint_t n_args_max, bool takes_kw);
-void mp_arg_parse_all(mp_uint_t n_pos, const mp_obj_t *pos, mp_map_t *kws, mp_uint_t n_allowed, const mp_arg_t *allowed, mp_arg_val_t *out_vals);
-void mp_arg_parse_all_kw_array(mp_uint_t n_pos, mp_uint_t n_kw, const mp_obj_t *args, mp_uint_t n_allowed, const mp_arg_t *allowed, mp_arg_val_t *out_vals);
+// extra printing method specifically for mp_obj_t's which are integral type
+int mp_print_mp_int(const mp_print_t *print, mp_obj_t x, int base, int base_char, int flags, char fill, int width, int prec);
+
+void mp_arg_check_num(size_t n_args, size_t n_kw, size_t n_args_min, size_t n_args_max, bool takes_kw);
+void mp_arg_parse_all(size_t n_pos, const mp_obj_t *pos, mp_map_t *kws, size_t n_allowed, const mp_arg_t *allowed, mp_arg_val_t *out_vals);
+void mp_arg_parse_all_kw_array(size_t n_pos, size_t n_kw, const mp_obj_t *args, size_t n_allowed, const mp_arg_t *allowed, mp_arg_val_t *out_vals);
 NORETURN void mp_arg_error_terse_mismatch(void);
 NORETURN void mp_arg_error_unimpl_kw(void);
 
@@ -85,22 +89,36 @@ void mp_delete_global(qstr qst);
 mp_obj_t mp_unary_op(mp_uint_t op, mp_obj_t arg);
 mp_obj_t mp_binary_op(mp_uint_t op, mp_obj_t lhs, mp_obj_t rhs);
 
-mp_obj_t mp_load_const_int(qstr qst);
-mp_obj_t mp_load_const_dec(qstr qst);
-mp_obj_t mp_load_const_str(qstr qst);
-mp_obj_t mp_load_const_bytes(qstr qst);
-
 mp_obj_t mp_call_function_0(mp_obj_t fun);
 mp_obj_t mp_call_function_1(mp_obj_t fun, mp_obj_t arg);
 mp_obj_t mp_call_function_2(mp_obj_t fun, mp_obj_t arg1, mp_obj_t arg2);
 mp_obj_t mp_call_function_n_kw(mp_obj_t fun, mp_uint_t n_args, mp_uint_t n_kw, const mp_obj_t *args);
 mp_obj_t mp_call_method_n_kw(mp_uint_t n_args, mp_uint_t n_kw, const mp_obj_t *args);
 mp_obj_t mp_call_method_n_kw_var(bool have_self, mp_uint_t n_args_n_kw, const mp_obj_t *args);
+mp_obj_t mp_call_method_self_n_kw(mp_obj_t meth, mp_obj_t self, size_t n_args, size_t n_kw, const mp_obj_t *args);
+// Call function and catch/dump exception - for Python callbacks from C code
+void mp_call_function_1_protected(mp_obj_t fun, mp_obj_t arg);
+void mp_call_function_2_protected(mp_obj_t fun, mp_obj_t arg1, mp_obj_t arg2);
+
+typedef struct _mp_call_args_t {
+    mp_obj_t fun;
+    mp_uint_t n_args, n_kw, n_alloc;
+    mp_obj_t *args;
+} mp_call_args_t;
+
+#if MICROPY_STACKLESS
+// Takes arguments which are the most general mix of Python arg types, and
+// prepares argument array suitable for passing to ->call() method of a
+// function object (and mp_call_function_n_kw()).
+// (Only needed in stackless mode.)
+void mp_call_prepare_args_n_kw_var(bool have_self, mp_uint_t n_args_n_kw, const mp_obj_t *args, mp_call_args_t *out_args);
+#endif
 
 void mp_unpack_sequence(mp_obj_t seq, mp_uint_t num, mp_obj_t *items);
 void mp_unpack_ex(mp_obj_t seq, mp_uint_t num, mp_obj_t *items);
 mp_obj_t mp_store_map(mp_obj_t map, mp_obj_t key, mp_obj_t value);
 mp_obj_t mp_load_attr(mp_obj_t base, qstr attr);
+void mp_convert_member_lookup(mp_obj_t obj, const mp_obj_type_t *type, mp_obj_t member, mp_obj_t *dest);
 void mp_load_method(mp_obj_t base, qstr attr, mp_obj_t *dest);
 void mp_load_method_maybe(mp_obj_t base, qstr attr, mp_obj_t *dest);
 void mp_store_attr(mp_obj_t base, qstr attr, mp_obj_t val);
@@ -116,8 +134,23 @@ mp_obj_t mp_import_name(qstr name, mp_obj_t fromlist, mp_obj_t level);
 mp_obj_t mp_import_from(mp_obj_t module, qstr name);
 void mp_import_all(mp_obj_t module);
 
-// Raise NotImplementedError with given message
-NORETURN void mp_not_implemented(const char *msg);
+NORETURN void mp_raise_msg(const mp_obj_type_t *exc_type, const char *msg);
+//NORETURN void nlr_raise_msg_varg(const mp_obj_type_t *exc_type, const char *fmt, ...);
+NORETURN void mp_raise_ValueError(const char *msg);
+NORETURN void mp_raise_TypeError(const char *msg);
+NORETURN void mp_raise_OSError(int errno_);
+NORETURN void mp_not_implemented(const char *msg); // Raise NotImplementedError with given message
+NORETURN void mp_exc_recursion_depth(void);
+
+#if MICROPY_BUILTIN_METHOD_CHECK_SELF_ARG
+#undef mp_check_self
+#define mp_check_self(pred)
+#else
+// A port may define to raise TypeError for example
+#ifndef mp_check_self
+#define mp_check_self(pred) assert(pred)
+#endif
+#endif
 
 // helper functions for native/viper code
 mp_uint_t mp_convert_obj_to_native(mp_obj_t obj, mp_uint_t type);
@@ -125,8 +158,8 @@ mp_obj_t mp_convert_native_to_obj(mp_uint_t val, mp_uint_t type);
 mp_obj_t mp_native_call_function_n_kw(mp_obj_t fun_in, mp_uint_t n_args_kw, const mp_obj_t *args);
 void mp_native_raise(mp_obj_t o);
 
-#define mp_sys_path ((mp_obj_t)&MP_STATE_VM(mp_sys_path_obj))
-#define mp_sys_argv ((mp_obj_t)&MP_STATE_VM(mp_sys_argv_obj))
+#define mp_sys_path (MP_OBJ_FROM_PTR(&MP_STATE_VM(mp_sys_path_obj)))
+#define mp_sys_argv (MP_OBJ_FROM_PTR(&MP_STATE_VM(mp_sys_argv_obj)))
 
 #if MICROPY_WARNINGS
 void mp_warning(const char *msg, ...);

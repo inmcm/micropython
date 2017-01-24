@@ -26,13 +26,16 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
 
 #include "py/nlr.h"
 #include "py/objtuple.h"
 #include "py/objlist.h"
 #include "py/runtime.h"
+#include "py/mperrno.h"
+#include "netutils.h"
 #include "modnetwork.h"
+
+#if MICROPY_PY_USOCKET
 
 /******************************************************************************/
 // socket class
@@ -40,7 +43,7 @@
 STATIC const mp_obj_type_t socket_type;
 
 // constructor socket(family=AF_INET, type=SOCK_STREAM, proto=0, fileno=None)
-STATIC mp_obj_t socket_make_new(mp_obj_t type_in, mp_uint_t n_args, mp_uint_t n_kw, const mp_obj_t *args) {
+STATIC mp_obj_t socket_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     mp_arg_check_num(n_args, n_kw, 0, 4, false);
 
     // create socket object (not bound to any NIC yet)
@@ -73,7 +76,7 @@ STATIC void socket_select_nic(mod_network_socket_obj_t *self, const byte *ip) {
         // call the NIC to open the socket
         int _errno;
         if (self->nic_type->socket(self, &_errno) != 0) {
-            nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+            mp_raise_OSError(_errno);
         }
     }
 }
@@ -82,6 +85,7 @@ STATIC mp_obj_t socket_close(mp_obj_t self_in) {
     mod_network_socket_obj_t *self = self_in;
     if (self->nic != MP_OBJ_NULL) {
         self->nic_type->close(self);
+        self->nic = MP_OBJ_NULL;
     }
     return mp_const_none;
 }
@@ -93,7 +97,7 @@ STATIC mp_obj_t socket_bind(mp_obj_t self_in, mp_obj_t addr_in) {
 
     // get address
     uint8_t ip[MOD_NETWORK_IPADDR_BUF_SIZE];
-    mp_uint_t port = mod_network_parse_inet_addr(addr_in, ip);
+    mp_uint_t port = netutils_parse_inet_addr(addr_in, ip, NETUTILS_BIG);
 
     // check if we need to select a NIC
     socket_select_nic(self, ip);
@@ -101,7 +105,7 @@ STATIC mp_obj_t socket_bind(mp_obj_t self_in, mp_obj_t addr_in) {
     // call the NIC to bind the socket
     int _errno;
     if (self->nic_type->bind(self, ip, port, &_errno) != 0) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
 
     return mp_const_none;
@@ -115,12 +119,12 @@ STATIC mp_obj_t socket_listen(mp_obj_t self_in, mp_obj_t backlog) {
     if (self->nic == MP_OBJ_NULL) {
         // not connected
         // TODO I think we can listen even if not bound...
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(ENOTCONN)));
+        mp_raise_OSError(MP_ENOTCONN);
     }
 
     int _errno;
     if (self->nic_type->listen(self, mp_obj_get_int(backlog), &_errno) != 0) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
 
     return mp_const_none;
@@ -143,7 +147,7 @@ STATIC mp_obj_t socket_accept(mp_obj_t self_in) {
     mp_uint_t port;
     int _errno;
     if (self->nic_type->accept(self, socket2, ip, &port, &_errno) != 0) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
 
     // new socket has valid state, so set the NIC to the same as parent
@@ -153,7 +157,7 @@ STATIC mp_obj_t socket_accept(mp_obj_t self_in) {
     // make the return value
     mp_obj_tuple_t *client = mp_obj_new_tuple(2, NULL);
     client->items[0] = socket2;
-    client->items[1] = mod_network_format_inet_addr(ip, port);
+    client->items[1] = netutils_format_inet_addr(ip, port, NETUTILS_BIG);
 
     return client;
 }
@@ -165,7 +169,7 @@ STATIC mp_obj_t socket_connect(mp_obj_t self_in, mp_obj_t addr_in) {
 
     // get address
     uint8_t ip[MOD_NETWORK_IPADDR_BUF_SIZE];
-    mp_uint_t port = mod_network_parse_inet_addr(addr_in, ip);
+    mp_uint_t port = netutils_parse_inet_addr(addr_in, ip, NETUTILS_BIG);
 
     // check if we need to select a NIC
     socket_select_nic(self, ip);
@@ -173,7 +177,7 @@ STATIC mp_obj_t socket_connect(mp_obj_t self_in, mp_obj_t addr_in) {
     // call the NIC to connect the socket
     int _errno;
     if (self->nic_type->connect(self, ip, port, &_errno) != 0) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
 
     return mp_const_none;
@@ -185,14 +189,14 @@ STATIC mp_obj_t socket_send(mp_obj_t self_in, mp_obj_t buf_in) {
     mod_network_socket_obj_t *self = self_in;
     if (self->nic == MP_OBJ_NULL) {
         // not connected
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(EPIPE)));
+        mp_raise_OSError(MP_EPIPE);
     }
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(buf_in, &bufinfo, MP_BUFFER_READ);
     int _errno;
     mp_uint_t ret = self->nic_type->send(self, bufinfo.buf, bufinfo.len, &_errno);
     if (ret == -1) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
     return mp_obj_new_int_from_uint(ret);
 }
@@ -203,7 +207,7 @@ STATIC mp_obj_t socket_recv(mp_obj_t self_in, mp_obj_t len_in) {
     mod_network_socket_obj_t *self = self_in;
     if (self->nic == MP_OBJ_NULL) {
         // not connected
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(ENOTCONN)));
+        mp_raise_OSError(MP_ENOTCONN);
     }
     mp_int_t len = mp_obj_get_int(len_in);
     vstr_t vstr;
@@ -211,7 +215,7 @@ STATIC mp_obj_t socket_recv(mp_obj_t self_in, mp_obj_t len_in) {
     int _errno;
     mp_uint_t ret = self->nic_type->recv(self, (byte*)vstr.buf, len, &_errno);
     if (ret == -1) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
     if (ret == 0) {
         return mp_const_empty_bytes;
@@ -231,7 +235,7 @@ STATIC mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_
 
     // get address
     uint8_t ip[MOD_NETWORK_IPADDR_BUF_SIZE];
-    mp_uint_t port = mod_network_parse_inet_addr(addr_in, ip);
+    mp_uint_t port = netutils_parse_inet_addr(addr_in, ip, NETUTILS_BIG);
 
     // check if we need to select a NIC
     socket_select_nic(self, ip);
@@ -240,7 +244,7 @@ STATIC mp_obj_t socket_sendto(mp_obj_t self_in, mp_obj_t data_in, mp_obj_t addr_
     int _errno;
     mp_int_t ret = self->nic_type->sendto(self, bufinfo.buf, bufinfo.len, ip, port, &_errno);
     if (ret == -1) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
 
     return mp_obj_new_int(ret);
@@ -252,7 +256,7 @@ STATIC mp_obj_t socket_recvfrom(mp_obj_t self_in, mp_obj_t len_in) {
     mod_network_socket_obj_t *self = self_in;
     if (self->nic == MP_OBJ_NULL) {
         // not connected
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(ENOTCONN)));
+        mp_raise_OSError(MP_ENOTCONN);
     }
     vstr_t vstr;
     vstr_init_len(&vstr, mp_obj_get_int(len_in));
@@ -261,7 +265,7 @@ STATIC mp_obj_t socket_recvfrom(mp_obj_t self_in, mp_obj_t len_in) {
     int _errno;
     mp_int_t ret = self->nic_type->recvfrom(self, (byte*)vstr.buf, vstr.len, ip, &port, &_errno);
     if (ret == -1) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
     mp_obj_t tuple[2];
     if (ret == 0) {
@@ -270,7 +274,7 @@ STATIC mp_obj_t socket_recvfrom(mp_obj_t self_in, mp_obj_t len_in) {
         vstr.len = ret;
         tuple[0] = mp_obj_new_str_from_vstr(&mp_type_bytes, &vstr);
     }
-    tuple[1] = mod_network_format_inet_addr(ip, port);
+    tuple[1] = netutils_format_inet_addr(ip, port, NETUTILS_BIG);
     return mp_obj_new_tuple(2, tuple);
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_2(socket_recvfrom_obj, socket_recvfrom);
@@ -286,7 +290,7 @@ STATIC mp_obj_t socket_setsockopt(mp_uint_t n_args, const mp_obj_t *args) {
     mp_uint_t optlen;
     mp_int_t val;
     if (mp_obj_is_integer(args[3])) {
-        val = mp_obj_int_get_truncated(args[3]);
+        val = mp_obj_get_int_truncated(args[3]);
         optval = &val;
         optlen = sizeof(val);
     } else {
@@ -298,7 +302,7 @@ STATIC mp_obj_t socket_setsockopt(mp_uint_t n_args, const mp_obj_t *args) {
 
     int _errno;
     if (self->nic_type->setsockopt(self, level, opt, optval, optlen, &_errno) != 0) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
 
     return mp_const_none;
@@ -313,13 +317,13 @@ STATIC mp_obj_t socket_settimeout(mp_obj_t self_in, mp_obj_t timeout_in) {
     mod_network_socket_obj_t *self = self_in;
     if (self->nic == MP_OBJ_NULL) {
         // not connected
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(ENOTCONN)));
+        mp_raise_OSError(MP_ENOTCONN);
     }
     mp_uint_t timeout;
     if (timeout_in == mp_const_none) {
         timeout = -1;
     } else {
-        #if MICROPY_PY_BUILTIN_FLOAT
+        #if MICROPY_PY_BUILTINS_FLOAT
         timeout = 1000 * mp_obj_get_float(timeout_in);
         #else
         timeout = 1000 * mp_obj_get_int(timeout_in);
@@ -327,7 +331,7 @@ STATIC mp_obj_t socket_settimeout(mp_obj_t self_in, mp_obj_t timeout_in) {
     }
     int _errno;
     if (self->nic_type->settimeout(self, timeout, &_errno) != 0) {
-        nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(_errno)));
+        mp_raise_OSError(_errno);
     }
     return mp_const_none;
 }
@@ -375,7 +379,7 @@ STATIC const mp_obj_type_t socket_type = {
     { &mp_type_type },
     .name = MP_QSTR_socket,
     .make_new = socket_make_new,
-    .stream_p = &socket_stream_p,
+    .protocol = &socket_stream_p,
     .locals_dict = (mp_obj_t)&socket_locals_dict,
 };
 
@@ -397,14 +401,14 @@ STATIC mp_obj_t mod_usocket_getaddrinfo(mp_obj_t host_in, mp_obj_t port_in) {
             int ret = nic_type->gethostbyname(nic, host, hlen, out_ip);
             if (ret != 0) {
                 // TODO CPython raises: socket.gaierror: [Errno -2] Name or service not known
-                nlr_raise(mp_obj_new_exception_arg1(&mp_type_OSError, MP_OBJ_NEW_SMALL_INT(ret)));
+                mp_raise_OSError(ret);
             }
             mp_obj_tuple_t *tuple = mp_obj_new_tuple(5, NULL);
             tuple->items[0] = MP_OBJ_NEW_SMALL_INT(MOD_NETWORK_AF_INET);
             tuple->items[1] = MP_OBJ_NEW_SMALL_INT(MOD_NETWORK_SOCK_STREAM);
             tuple->items[2] = MP_OBJ_NEW_SMALL_INT(0);
             tuple->items[3] = MP_OBJ_NEW_QSTR(MP_QSTR_);
-            tuple->items[4] = mod_network_format_inet_addr(out_ip, port);
+            tuple->items[4] = netutils_format_inet_addr(out_ip, port, NETUTILS_BIG);
             return mp_obj_new_list(1, (mp_obj_t*)&tuple);
         }
     }
@@ -442,6 +446,7 @@ STATIC MP_DEFINE_CONST_DICT(mp_module_usocket_globals, mp_module_usocket_globals
 
 const mp_obj_module_t mp_module_usocket = {
     .base = { &mp_type_module },
-    .name = MP_QSTR_usocket,
     .globals = (mp_obj_dict_t*)&mp_module_usocket_globals,
 };
+
+#endif  // MICROPY_PY_USOCKET

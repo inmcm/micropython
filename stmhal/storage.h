@@ -26,6 +26,9 @@
 
 #define FLASH_BLOCK_SIZE (512)
 
+#define STORAGE_SYSTICK_MASK    (0x1ff) // 512ms
+#define STORAGE_IDLE_TICK(tick) (((tick) & STORAGE_SYSTICK_MASK) == 2)
+
 void storage_init(void);
 uint32_t storage_get_block_size(void);
 uint32_t storage_get_block_count(void);
@@ -33,3 +36,12 @@ void storage_irq_handler(void);
 void storage_flush(void);
 bool storage_read_block(uint8_t *dest, uint32_t block);
 bool storage_write_block(const uint8_t *src, uint32_t block);
+
+// these return 0 on success, non-zero on error
+mp_uint_t storage_read_blocks(uint8_t *dest, uint32_t block_num, uint32_t num_blocks);
+mp_uint_t storage_write_blocks(const uint8_t *src, uint32_t block_num, uint32_t num_blocks);
+
+extern const struct _mp_obj_type_t pyb_flash_type;
+
+struct _fs_user_mount_t;
+void pyb_flash_init_vfs(struct _fs_user_mount_t *vfs);

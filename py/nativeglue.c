@@ -32,8 +32,7 @@
 #include "py/runtime0.h"
 #include "py/runtime.h"
 #include "py/emitglue.h"
-
-#if MICROPY_EMIT_NATIVE
+#include "py/bc.h"
 
 #if 0 // print debugging info
 #define DEBUG_printf DEBUG_printf
@@ -41,37 +40,49 @@
 #define DEBUG_printf(...) (void)0
 #endif
 
+#if MICROPY_EMIT_NATIVE
+
 // convert a Micro Python object to a valid native value based on type
 mp_uint_t mp_convert_obj_to_native(mp_obj_t obj, mp_uint_t type) {
     DEBUG_printf("mp_convert_obj_to_native(%p, " UINT_FMT ")\n", obj, type);
-    switch (type & 3) {
+    switch (type & 0xf) {
         case MP_NATIVE_TYPE_OBJ: return (mp_uint_t)obj;
         case MP_NATIVE_TYPE_BOOL:
-        case MP_NATIVE_TYPE_INT: return mp_obj_get_int(obj);
-        case MP_NATIVE_TYPE_UINT: {
+        case MP_NATIVE_TYPE_INT:
+        case MP_NATIVE_TYPE_UINT: return mp_obj_get_int_truncated(obj);
+        default: { // cast obj to a pointer
             mp_buffer_info_t bufinfo;
             if (mp_get_buffer(obj, &bufinfo, MP_BUFFER_RW)) {
                 return (mp_uint_t)bufinfo.buf;
             } else {
-                // TODO should be mp_obj_get_uint_truncated or something
-                return mp_obj_get_int(obj);
+                // assume obj is an integer that represents an address
+                return mp_obj_get_int_truncated(obj);
             }
         }
-        default: assert(0); return 0;
     }
 }
+
+#endif
+
+#if MICROPY_EMIT_NATIVE || MICROPY_EMIT_INLINE_ASM
 
 // convert a native value to a Micro Python object based on type
 mp_obj_t mp_convert_native_to_obj(mp_uint_t val, mp_uint_t type) {
     DEBUG_printf("mp_convert_native_to_obj(" UINT_FMT ", " UINT_FMT ")\n", val, type);
-    switch (type & 3) {
+    switch (type & 0xf) {
         case MP_NATIVE_TYPE_OBJ: return (mp_obj_t)val;
-        case MP_NATIVE_TYPE_BOOL: return MP_BOOL(val);
+        case MP_NATIVE_TYPE_BOOL: return mp_obj_new_bool(val);
         case MP_NATIVE_TYPE_INT: return mp_obj_new_int(val);
         case MP_NATIVE_TYPE_UINT: return mp_obj_new_int_from_uint(val);
-        default: assert(0); return mp_const_none;
+        default: // a pointer
+            // we return just the value of the pointer as an integer
+            return mp_obj_new_int_from_uint(val);
     }
 }
+
+#endif
+
+#if MICROPY_EMIT_NATIVE
 
 // wrapper that accepts n_args and n_kw in one argument
 // (native emitter can only pass at most 3 arguments to a function)
@@ -91,8 +102,6 @@ void mp_native_raise(mp_obj_t o) {
 void *const mp_fun_table[MP_F_NUMBER_OF] = {
     mp_convert_obj_to_native,
     mp_convert_native_to_obj,
-    mp_load_const_str,
-    mp_load_const_bytes,
     mp_load_name,
     mp_load_global,
     mp_load_build_class,
@@ -117,6 +126,7 @@ void *const mp_fun_table[MP_F_NUMBER_OF] = {
     mp_make_function_from_raw_code,
     mp_native_call_function_n_kw,
     mp_call_method_n_kw,
+    mp_call_method_n_kw_var,
     mp_getiter,
     mp_iternext,
     nlr_push,
@@ -132,6 +142,9 @@ void *const mp_fun_table[MP_F_NUMBER_OF] = {
     mp_unpack_ex,
     mp_delete_name,
     mp_delete_global,
+    mp_obj_new_cell,
+    mp_make_closure_from_raw_code,
+    mp_setup_code_state,
 };
 
 /*

@@ -4,8 +4,8 @@
 
 #include "py/nlr.h"
 #include "py/runtime.h"
+#include "py/mphal.h"
 #include "led.h"
-#include MICROPY_HAL_H
 #include "pin.h"
 #include "genhdr/pins.h"
 
@@ -83,13 +83,13 @@ void led_toggle(pyb_led_t led) {
 /******************************************************************************/
 /* Micro Python bindings                                                      */
 
-void led_obj_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+void led_obj_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     pyb_led_obj_t *self = self_in;
     (void)kind;
-    print(env, "<LED %lu>", self->led_id);
+    mp_printf(print, "<LED %lu>", self->led_id);
 }
 
-STATIC mp_obj_t led_obj_make_new(mp_obj_t type_in, uint n_args, uint n_kw, const mp_obj_t *args) {
+STATIC mp_obj_t led_obj_make_new(const mp_obj_type_t *type, uint n_args, uint n_kw, const mp_obj_t *args) {
     // check arguments
     mp_arg_check_num(n_args, n_kw, 1, 1, false);
 

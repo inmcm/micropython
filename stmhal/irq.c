@@ -26,11 +26,14 @@
 
 #include "py/nlr.h"
 #include "py/obj.h"
+#include "py/mphal.h"
 #include "irq.h"
 
-#include MICROPY_HAL_H
-
 /// \moduleref pyb
+
+#if IRQ_ENABLE_STATS
+uint32_t irq_stats[FPU_IRQn + 1] = {0};
+#endif
 
 /// \function wfi()
 /// Wait for an interrupt.
@@ -48,7 +51,7 @@ MP_DEFINE_CONST_FUN_OBJ_0(pyb_wfi_obj, pyb_wfi);
 /// respectively.  This return value can be passed to enable_irq to restore
 /// the IRQ to its original state.
 STATIC mp_obj_t pyb_disable_irq(void) {
-    return MP_BOOL(disable_irq() == IRQ_STATE_ENABLED);
+    return mp_obj_new_bool(disable_irq() == IRQ_STATE_ENABLED);
 }
 MP_DEFINE_CONST_FUN_OBJ_0(pyb_disable_irq_obj, pyb_disable_irq);
 
@@ -63,3 +66,11 @@ STATIC mp_obj_t pyb_enable_irq(uint n_args, const mp_obj_t *arg) {
     return mp_const_none;
 }
 MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(pyb_enable_irq_obj, 0, 1, pyb_enable_irq);
+
+#if IRQ_ENABLE_STATS
+// return a memoryview of the irq statistics array
+STATIC mp_obj_t pyb_irq_stats(void) {
+    return mp_obj_new_memoryview(0x80 | 'I', MP_ARRAY_SIZE(irq_stats), &irq_stats[0]);
+}
+MP_DEFINE_CONST_FUN_OBJ_0(pyb_irq_stats_obj, pyb_irq_stats);
+#endif

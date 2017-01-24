@@ -3,11 +3,12 @@
 #include "std.h"
 
 #include "py/mpconfig.h"
-#include MICROPY_HAL_H
+#include "py/obj.h"
 #include "simplelink.h"
 #include "diskio.h"
 #include "sflash_diskio.h"
 #include "debug.h"
+#include "modnetwork.h"
 #include "modwlan.h"
 
 #define SFLASH_TIMEOUT_MAX_MS               5500
@@ -52,13 +53,25 @@ DRESULT sflash_disk_init (void) {
         // Allocate space for the block cache
         ASSERT ((sflash_block_cache = mem_Malloc(SFLASH_BLOCK_SIZE)) != NULL);
         sflash_init_done = true;
+        sflash_prblock = UINT32_MAX;
+        sflash_cache_is_dirty = false;
 
-        // Proceed to format the memory if not done yet
+        // In order too speed up booting, check the last block, if exists, then
+        // it means that the file system has been already created
+        print_block_name (SFLASH_BLOCK_COUNT - 1);
+        sl_LockObjLock (&wlan_LockObj, SL_OS_WAIT_FOREVER);
+        if (!sl_FsGetInfo(sflash_block_name, 0, &FsFileInfo)) {
+            sl_LockObjUnlock (&wlan_LockObj);
+            return RES_OK;
+        }
+        sl_LockObjUnlock (&wlan_LockObj);
+
+        // Proceed to format the memory
         for (int i = 0; i < SFLASH_BLOCK_COUNT; i++) {
             print_block_name (i);
             sl_LockObjLock (&wlan_LockObj, SL_OS_WAIT_FOREVER);
             // Create the block file if it doesn't exist
-            if (sl_FsGetInfo(sflash_block_name, 0, &FsFileInfo) < 0) {
+            if (sl_FsGetInfo(sflash_block_name, 0, &FsFileInfo) != 0) {
                 if (!sl_FsOpen(sflash_block_name, FS_MODE_OPEN_CREATE(SFLASH_BLOCK_SIZE, 0), NULL, &fileHandle)) {
                     sl_FsClose(fileHandle, NULL, NULL, 0);
                     sl_LockObjUnlock (&wlan_LockObj);
@@ -75,8 +88,6 @@ DRESULT sflash_disk_init (void) {
             }
             sl_LockObjUnlock (&wlan_LockObj);
         }
-        sflash_prblock = UINT32_MAX;
-        sflash_cache_is_dirty = false;
     }
     return RES_OK;
 }
@@ -85,7 +96,7 @@ DRESULT sflash_disk_status(void) {
     if (!sflash_init_done) {
         return STA_NOINIT;
     }
-    return 0;
+    return RES_OK;
 }
 
 DRESULT sflash_disk_read(BYTE *buff, DWORD sector, UINT count) {
@@ -115,7 +126,7 @@ DRESULT sflash_disk_read(BYTE *buff, DWORD sector, UINT count) {
         }
         // Copy the requested sector from the block cache
         memcpy (buff, &sflash_block_cache[(secindex * SFLASH_SECTOR_SIZE)], SFLASH_SECTOR_SIZE);
-        buff += SFLASH_BLOCK_SIZE;
+        buff += SFLASH_SECTOR_SIZE;
     }
     return RES_OK;
 }
@@ -150,7 +161,7 @@ DRESULT sflash_disk_write(const BYTE *buff, DWORD sector, UINT count) {
         }
         // Copy the input sector to the block cache
         memcpy (&sflash_block_cache[(secindex * SFLASH_SECTOR_SIZE)], buff, SFLASH_SECTOR_SIZE);
-        buff += SFLASH_BLOCK_SIZE;
+        buff += SFLASH_SECTOR_SIZE;
         sflash_cache_is_dirty = true;
     } while (++index < count);
 

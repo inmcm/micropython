@@ -28,7 +28,11 @@
 #include <assert.h>
 
 #include "py/mpstate.h"
+#include "py/reader.h"
 #include "py/lexer.h"
+#include "py/runtime.h"
+
+#if MICROPY_ENABLE_COMPILER
 
 #define TAB_SIZE (8)
 
@@ -48,6 +52,7 @@ STATIC bool str_strn_equal(const char *str, const char *strn, mp_uint_t len) {
     return i == len && *str == 0;
 }
 
+#define MP_LEXER_EOF ((unichar)MP_READER_EOF)
 #define CUR_CHAR(lex) ((lex)->chr0)
 
 STATIC bool is_end(mp_lexer_t *lex) {
@@ -58,33 +63,33 @@ STATIC bool is_physical_newline(mp_lexer_t *lex) {
     return lex->chr0 == '\n';
 }
 
-STATIC bool is_char(mp_lexer_t *lex, char c) {
+STATIC bool is_char(mp_lexer_t *lex, byte c) {
     return lex->chr0 == c;
 }
 
-STATIC bool is_char_or(mp_lexer_t *lex, char c1, char c2) {
+STATIC bool is_char_or(mp_lexer_t *lex, byte c1, byte c2) {
     return lex->chr0 == c1 || lex->chr0 == c2;
 }
 
-STATIC bool is_char_or3(mp_lexer_t *lex, char c1, char c2, char c3) {
+STATIC bool is_char_or3(mp_lexer_t *lex, byte c1, byte c2, byte c3) {
     return lex->chr0 == c1 || lex->chr0 == c2 || lex->chr0 == c3;
 }
 
 /*
-STATIC bool is_char_following(mp_lexer_t *lex, char c) {
+STATIC bool is_char_following(mp_lexer_t *lex, byte c) {
     return lex->chr1 == c;
 }
 */
 
-STATIC bool is_char_following_or(mp_lexer_t *lex, char c1, char c2) {
+STATIC bool is_char_following_or(mp_lexer_t *lex, byte c1, byte c2) {
     return lex->chr1 == c1 || lex->chr1 == c2;
 }
 
-STATIC bool is_char_following_following_or(mp_lexer_t *lex, char c1, char c2) {
+STATIC bool is_char_following_following_or(mp_lexer_t *lex, byte c1, byte c2) {
     return lex->chr2 == c1 || lex->chr2 == c2;
 }
 
-STATIC bool is_char_and(mp_lexer_t *lex, char c1, char c2) {
+STATIC bool is_char_and(mp_lexer_t *lex, byte c1, byte c2) {
     return lex->chr0 == c1 && lex->chr1 == c2;
 }
 
@@ -104,29 +109,25 @@ STATIC bool is_following_digit(mp_lexer_t *lex) {
     return unichar_isdigit(lex->chr1);
 }
 
-STATIC bool is_following_letter(mp_lexer_t *lex) {
-    return unichar_isalpha(lex->chr1);
+STATIC bool is_following_base_char(mp_lexer_t *lex) {
+    const unichar chr1 = lex->chr1 | 0x20;
+    return chr1 == 'b' || chr1 == 'o' || chr1 == 'x';
 }
 
 STATIC bool is_following_odigit(mp_lexer_t *lex) {
     return lex->chr1 >= '0' && lex->chr1 <= '7';
 }
 
-// TODO UNICODE include unicode characters in definition of identifiers
+// to easily parse utf-8 identifiers we allow any raw byte with high bit set
 STATIC bool is_head_of_identifier(mp_lexer_t *lex) {
-    return is_letter(lex) || lex->chr0 == '_';
+    return is_letter(lex) || lex->chr0 == '_' || lex->chr0 >= 0x80;
 }
 
-// TODO UNICODE include unicode characters in definition of identifiers
 STATIC bool is_tail_of_identifier(mp_lexer_t *lex) {
     return is_head_of_identifier(lex) || is_digit(lex);
 }
 
 STATIC void next_char(mp_lexer_t *lex) {
-    if (lex->chr0 == MP_LEXER_EOF) {
-        return;
-    }
-
     if (lex->chr0 == '\n') {
         // a new line
         ++lex->line;
@@ -141,7 +142,7 @@ STATIC void next_char(mp_lexer_t *lex) {
 
     lex->chr0 = lex->chr1;
     lex->chr1 = lex->chr2;
-    lex->chr2 = lex->stream_next_byte(lex->stream_data);
+    lex->chr2 = lex->reader.readbyte(lex->reader.data);
 
     if (lex->chr0 == '\r') {
         // CR is a new line, converted to LF
@@ -149,7 +150,7 @@ STATIC void next_char(mp_lexer_t *lex) {
         if (lex->chr1 == '\n') {
             // CR LF is a single new line
             lex->chr1 = lex->chr2;
-            lex->chr2 = lex->stream_next_byte(lex->stream_data);
+            lex->chr2 = lex->reader.readbyte(lex->reader.data);
         }
     }
 
@@ -187,7 +188,7 @@ STATIC void indent_pop(mp_lexer_t *lex) {
 //     c<op> = continue with <op>, if this opchar matches then continue matching
 // this means if the start of two ops are the same then they are equal til the last char
 
-STATIC const char *tok_enc =
+STATIC const char *const tok_enc =
     "()[]{},:;@~" // singles
     "<e=c<e="     // < <= << <<=
     ">e=c>e="     // > >= >> >>=
@@ -224,13 +225,17 @@ STATIC const uint8_t tok_enc_kind[] = {
 };
 
 // must have the same order as enum in lexer.h
-STATIC const char *tok_kw[] = {
+STATIC const char *const tok_kw[] = {
     "False",
     "None",
     "True",
     "and",
     "as",
     "assert",
+    #if MICROPY_PY_ASYNC_AWAIT
+    "async",
+    "await",
+    #endif
     "break",
     "class",
     "continue",
@@ -261,16 +266,6 @@ STATIC const char *tok_kw[] = {
     "__debug__",
 };
 
-STATIC mp_uint_t hex_digit(unichar c) {
-    // c is assumed to be hex digit
-    mp_uint_t n = c - '0';
-    if (n > 9) {
-        n &= ~('a' - 'A');
-        n -= ('A' - ('9' + 1));
-    }
-    return n;
-}
-
 // This is called with CUR_CHAR() before first hex digit, and should return with
 // it pointing to last hex digit
 // num_digits must be greater than zero
@@ -282,7 +277,7 @@ STATIC bool get_hex(mp_lexer_t *lex, mp_uint_t num_digits, mp_uint_t *result) {
         if (!unichar_isxdigit(c)) {
             return false;
         }
-        num = (num << 4) + hex_digit(c);
+        num = (num << 4) + unichar_xdigit_value(c);
     }
     *result = num;
     return true;
@@ -346,7 +341,6 @@ STATIC void mp_lexer_next_token_into(mp_lexer_t *lex, bool first_token) {
         lex->tok_kind = MP_TOKEN_NEWLINE;
 
         mp_uint_t num_spaces = lex->column - 1;
-        lex->emit_dent = 0;
         if (num_spaces == indent_top(lex)) {
         } else if (num_spaces > indent_top(lex)) {
             indent_push(lex, num_spaces);
@@ -362,16 +356,7 @@ STATIC void mp_lexer_next_token_into(mp_lexer_t *lex, bool first_token) {
         }
 
     } else if (is_end(lex)) {
-        if (indent_top(lex) > 0) {
-            lex->tok_kind = MP_TOKEN_NEWLINE;
-            lex->emit_dent = 0;
-            while (indent_top(lex) > 0) {
-                indent_pop(lex);
-                lex->emit_dent -= 1;
-            }
-        } else {
-            lex->tok_kind = MP_TOKEN_END;
-        }
+        lex->tok_kind = MP_TOKEN_END;
 
     } else if (is_char_or(lex, '\'', '\"')
                || (is_char_or3(lex, 'r', 'u', 'b') && is_char_following_or(lex, '\'', '\"'))
@@ -441,8 +426,9 @@ STATIC void mp_lexer_next_token_into(mp_lexer_t *lex, bool first_token) {
                         vstr_add_char(&lex->vstr, '\\');
                     } else {
                         switch (c) {
-                            case MP_LEXER_EOF: break; // TODO a proper error message?
-                            case '\n': c = MP_LEXER_EOF; break; // TODO check this works correctly (we are supposed to ignore it
+                            // note: "c" can never be MP_LEXER_EOF because next_char
+                            // always inserts a newline at the end of the input stream
+                            case '\n': c = MP_LEXER_EOF; break; // backslash escape the newline, just ignore it
                             case '\\': break;
                             case '\'': break;
                             case '"': break;
@@ -465,8 +451,8 @@ STATIC void mp_lexer_next_token_into(mp_lexer_t *lex, bool first_token) {
                             {
                                 mp_uint_t num = 0;
                                 if (!get_hex(lex, (c == 'x' ? 2 : c == 'u' ? 4 : 8), &num)) {
-                                    // TODO error message
-                                    assert(0);
+                                    // not enough hex chars for escape sequence
+                                    lex->tok_kind = MP_TOKEN_INVALID;
                                 }
                                 c = num;
                                 break;
@@ -477,7 +463,7 @@ STATIC void mp_lexer_next_token_into(mp_lexer_t *lex, bool first_token) {
                                 // 3MB of text; even gzip-compressed and with minimal structure, it'll take
                                 // roughly half a meg of storage. This form of Unicode escape may be added
                                 // later on, but it's definitely not a priority right now. -- CJA 20140607
-                                assert(!"Unicode name escapes not supported");
+                                mp_not_implemented("unicode name escapes");
                                 break;
                             default:
                                 if (c >= '0' && c <= '7') {
@@ -497,20 +483,25 @@ STATIC void mp_lexer_next_token_into(mp_lexer_t *lex, bool first_token) {
                         }
                     }
                     if (c != MP_LEXER_EOF) {
-                        #if MICROPY_PY_BUILTINS_STR_UNICODE
-                        if (c < 0x110000 && !is_bytes) {
-                            vstr_add_char(&lex->vstr, c);
-                        } else if (c < 0x100 && is_bytes) {
-                            vstr_add_byte(&lex->vstr, c);
-                        }
-                        #else
-                        // without unicode everything is just added as an 8-bit byte
-                        if (c < 0x100) {
-                            vstr_add_byte(&lex->vstr, c);
-                        }
-                        #endif
-                        else {
-                            assert(!"TODO: Throw an error, invalid escape code probably");
+                        if (MICROPY_PY_BUILTINS_STR_UNICODE_DYNAMIC) {
+                            if (c < 0x110000 && !is_bytes) {
+                                vstr_add_char(&lex->vstr, c);
+                            } else if (c < 0x100 && is_bytes) {
+                                vstr_add_byte(&lex->vstr, c);
+                            } else {
+                                // unicode character out of range
+                                // this raises a generic SyntaxError; could provide more info
+                                lex->tok_kind = MP_TOKEN_INVALID;
+                            }
+                        } else {
+                            // without unicode everything is just added as an 8-bit byte
+                            if (c < 0x100) {
+                                vstr_add_byte(&lex->vstr, c);
+                            } else {
+                                // 8-bit character out of range
+                                // this raises a generic SyntaxError; could provide more info
+                                lex->tok_kind = MP_TOKEN_INVALID;
+                            }
                         }
                     }
                 } else {
@@ -533,13 +524,13 @@ STATIC void mp_lexer_next_token_into(mp_lexer_t *lex, bool first_token) {
     } else if (is_head_of_identifier(lex)) {
         lex->tok_kind = MP_TOKEN_NAME;
 
-        // get first char
-        vstr_add_char(&lex->vstr, CUR_CHAR(lex));
+        // get first char (add as byte to remain 8-bit clean and support utf-8)
+        vstr_add_byte(&lex->vstr, CUR_CHAR(lex));
         next_char(lex);
 
         // get tail chars
         while (!is_end(lex) && is_tail_of_identifier(lex)) {
-            vstr_add_char(&lex->vstr, CUR_CHAR(lex));
+            vstr_add_byte(&lex->vstr, CUR_CHAR(lex));
             next_char(lex);
         }
 
@@ -549,7 +540,7 @@ STATIC void mp_lexer_next_token_into(mp_lexer_t *lex, bool first_token) {
             lex->tok_kind = MP_TOKEN_FLOAT_OR_IMAG;
         } else {
             lex->tok_kind = MP_TOKEN_INTEGER;
-            if (is_char(lex, '0') && is_following_letter(lex)) {
+            if (is_char(lex, '0') && is_following_base_char(lex)) {
                 forced_integer = true;
             }
         }
@@ -696,21 +687,17 @@ STATIC void mp_lexer_next_token_into(mp_lexer_t *lex, bool first_token) {
     }
 }
 
-mp_lexer_t *mp_lexer_new(qstr src_name, void *stream_data, mp_lexer_stream_next_byte_t stream_next_byte, mp_lexer_stream_close_t stream_close) {
+mp_lexer_t *mp_lexer_new(qstr src_name, mp_reader_t reader) {
     mp_lexer_t *lex = m_new_obj_maybe(mp_lexer_t);
 
     // check for memory allocation error
     if (lex == NULL) {
-        if (stream_close) {
-            stream_close(stream_data);
-        }
+        reader.close(reader.data);
         return NULL;
     }
 
     lex->source_name = src_name;
-    lex->stream_data = stream_data;
-    lex->stream_next_byte = stream_next_byte;
-    lex->stream_close = stream_close;
+    lex->reader = reader;
     lex->line = 1;
     lex->column = 1;
     lex->emit_dent = 0;
@@ -721,7 +708,8 @@ mp_lexer_t *mp_lexer_new(qstr src_name, void *stream_data, mp_lexer_stream_next_
     vstr_init(&lex->vstr, 32);
 
     // check for memory allocation error
-    if (lex->indent_level == NULL || vstr_had_error(&lex->vstr)) {
+    // note: vstr_init above may fail on malloc, but so may mp_lexer_next_token_into below
+    if (lex->indent_level == NULL) {
         mp_lexer_free(lex);
         return NULL;
     }
@@ -730,9 +718,9 @@ mp_lexer_t *mp_lexer_new(qstr src_name, void *stream_data, mp_lexer_stream_next_
     lex->indent_level[0] = 0;
 
     // preload characters
-    lex->chr0 = stream_next_byte(stream_data);
-    lex->chr1 = stream_next_byte(stream_data);
-    lex->chr2 = stream_next_byte(stream_data);
+    lex->chr0 = reader.readbyte(reader.data);
+    lex->chr1 = reader.readbyte(reader.data);
+    lex->chr2 = reader.readbyte(reader.data);
 
     // if input stream is 0, 1 or 2 characters long and doesn't end in a newline, then insert a newline at the end
     if (lex->chr0 == MP_LEXER_EOF) {
@@ -757,11 +745,43 @@ mp_lexer_t *mp_lexer_new(qstr src_name, void *stream_data, mp_lexer_stream_next_
     return lex;
 }
 
+mp_lexer_t *mp_lexer_new_from_str_len(qstr src_name, const char *str, mp_uint_t len, mp_uint_t free_len) {
+    mp_reader_t reader;
+    if (!mp_reader_new_mem(&reader, (const byte*)str, len, free_len)) {
+        return NULL;
+    }
+    return mp_lexer_new(src_name, reader);
+}
+
+#if MICROPY_READER_POSIX || MICROPY_READER_FATFS
+
+mp_lexer_t *mp_lexer_new_from_file(const char *filename) {
+    mp_reader_t reader;
+    int ret = mp_reader_new_file(&reader, filename);
+    if (ret != 0) {
+        return NULL;
+    }
+    return mp_lexer_new(qstr_from_str(filename), reader);
+}
+
+#if MICROPY_HELPER_LEXER_UNIX
+
+mp_lexer_t *mp_lexer_new_from_fd(qstr filename, int fd, bool close_fd) {
+    mp_reader_t reader;
+    int ret = mp_reader_new_file_from_fd(&reader, fd, close_fd);
+    if (ret != 0) {
+        return NULL;
+    }
+    return mp_lexer_new(filename, reader);
+}
+
+#endif
+
+#endif
+
 void mp_lexer_free(mp_lexer_t *lex) {
     if (lex) {
-        if (lex->stream_close) {
-            lex->stream_close(lex->stream_data);
-        }
+        lex->reader.close(lex->reader.data);
         vstr_clear(&lex->vstr);
         m_del(uint16_t, lex->indent_level, lex->alloc_indent_level);
         m_del_obj(mp_lexer_t, lex);
@@ -772,7 +792,9 @@ void mp_lexer_to_next(mp_lexer_t *lex) {
     mp_lexer_next_token_into(lex, false);
 }
 
-#if MICROPY_DEBUG_PRINTERS
+#if 0
+// This function is used to print the current token and should only be
+// needed to debug the lexer, so it's not available via a config option.
 void mp_lexer_show_token(const mp_lexer_t *lex) {
     printf("(" UINT_FMT ":" UINT_FMT ") kind:%u str:%p len:%zu", lex->tok_line, lex->tok_column, lex->tok_kind, lex->vstr.buf, lex->vstr.len);
     if (lex->vstr.len > 0) {
@@ -783,7 +805,7 @@ void mp_lexer_show_token(const mp_lexer_t *lex) {
             unichar c = utf8_get_char(i);
             i = utf8_next_char(i);
             if (unichar_isprint(c)) {
-                printf("%c", c);
+                printf("%c", (int)c);
             } else {
                 printf("?");
             }
@@ -792,3 +814,5 @@ void mp_lexer_show_token(const mp_lexer_t *lex) {
     printf("\n");
 }
 #endif
+
+#endif // MICROPY_ENABLE_COMPILER

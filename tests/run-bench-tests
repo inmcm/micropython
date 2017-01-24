@@ -22,7 +22,7 @@ def run_tests(pyb, test_dict):
     test_count = 0
     testcase_count = 0
 
-    for base_test, tests in test_dict.items():
+    for base_test, tests in sorted(test_dict.items()):
         print(base_test + ":")
         for test_file in tests:
 
@@ -58,7 +58,7 @@ def run_tests(pyb, test_dict):
     return True
 
 def main():
-    cmd_parser = argparse.ArgumentParser(description='Run tests for Micro Python.')
+    cmd_parser = argparse.ArgumentParser(description='Run tests for MicroPython.')
     cmd_parser.add_argument('--pyboard', action='store_true', help='run the tests on the pyboard')
     cmd_parser.add_argument('files', nargs='*', help='input test files')
     args = cmd_parser.parse_args()

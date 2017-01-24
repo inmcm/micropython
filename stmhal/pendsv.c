@@ -25,20 +25,23 @@
  */
 
 #include <stdlib.h>
-#include <stm32f4xx_hal.h>
+#include STM32_HAL_H
 
 #include "py/mpstate.h"
 #include "py/runtime.h"
 #include "pendsv.h"
+#include "irq.h"
 
-// Note: this can contain point to the heap but is not traced by GC.
-// This is okay because we only ever set it to mp_const_vcp_interrupt
-// which is in the root-pointer set.
-STATIC void *pendsv_object;
+// This variable is used to save the exception object between a ctrl-C and the
+// PENDSV call that actually raises the exception.  It must be non-static
+// otherwise gcc-5 optimises it away.  It can point to the heap but is not
+// traced by GC.  This is okay because we only ever set it to
+// mp_kbd_exception which is in the root-pointer set.
+void *pendsv_object;
 
 void pendsv_init(void) {
     // set PendSV interrupt at lowest priority
-    HAL_NVIC_SetPriority(PendSV_IRQn, 0xf, 0xf);
+    HAL_NVIC_SetPriority(PendSV_IRQn, IRQ_PRI_PENDSV, IRQ_SUBPRI_PENDSV);
 }
 
 // Call this function to raise a pending exception during an interrupt.
@@ -58,10 +61,6 @@ void pendsv_nlr_jump(void *o) {
         SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;
     }
 }
-
-// since we play tricks with the stack, the compiler must not generate a
-// prelude for this function
-void pendsv_isr_handler(void) __attribute__((naked));
 
 void pendsv_isr_handler(void) {
     // re-jig the stack so that when we return from this interrupt handler

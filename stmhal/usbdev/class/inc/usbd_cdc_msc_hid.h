@@ -6,9 +6,10 @@
 #include  "usbd_msc_scsi.h"
 #include  "usbd_ioreq.h"
 
-// CDC and MSC packet sizes
+// CDC, MSC and HID packet sizes
 #define CDC_DATA_FS_MAX_PACKET_SIZE (64) // endpoint IN & OUT packet size
 #define MSC_MEDIA_PACKET            (2048) // was 8192; how low can it go whilst still working?
+#define HID_DATA_FS_MAX_PACKET_SIZE (64) // endpoint IN & OUT packet size
 
 // Need to define here for BOT and SCSI layers
 #define MSC_IN_EP     (0x81)
@@ -45,6 +46,11 @@ typedef struct {
   __IO uint32_t TxState;     
   __IO uint32_t RxState;    
 } USBD_CDC_HandleTypeDef;
+
+typedef struct _USBD_HID_Itf {
+  int8_t (* Init)   (void);
+  int8_t (* Receive)(uint8_t *, uint32_t);
+} USBD_HID_ItfTypeDef;
 
 typedef struct _USBD_STORAGE {
   int8_t (* Init) (uint8_t lun);
@@ -94,6 +100,8 @@ extern USBD_ClassTypeDef USBD_CDC_MSC_HID;
 
 // returns 0 on success, -1 on failure
 int USBD_SelectMode(uint32_t mode, USBD_HID_ModeInfoTypeDef *hid_info);
+// returns the current usb mode
+uint8_t USBD_GetMode();
 
 uint8_t USBD_CDC_RegisterInterface  (USBD_HandleTypeDef   *pdev, USBD_CDC_ItfTypeDef *fops);
 uint8_t USBD_CDC_SetTxBuffer  (USBD_HandleTypeDef   *pdev, uint8_t  *pbuff, uint16_t length);
@@ -103,7 +111,12 @@ uint8_t USBD_CDC_TransmitPacket  (USBD_HandleTypeDef *pdev);
 
 uint8_t USBD_MSC_RegisterStorage(USBD_HandleTypeDef *pdev, USBD_StorageTypeDef *fops);
 
+uint8_t USBD_HID_RegisterInterface(USBD_HandleTypeDef *pdev, USBD_HID_ItfTypeDef *fops);
+uint8_t USBD_HID_SetRxBuffer(USBD_HandleTypeDef *pdev, uint8_t *pbuff);
+uint8_t USBD_HID_ReceivePacket(USBD_HandleTypeDef *pdev);
 int USBD_HID_CanSendReport(USBD_HandleTypeDef *pdev);
 uint8_t USBD_HID_SendReport(USBD_HandleTypeDef *pdev, uint8_t *report, uint16_t len);
+uint8_t USBD_HID_SetNAK(USBD_HandleTypeDef *pdev);
+uint8_t USBD_HID_ClearNAK(USBD_HandleTypeDef *pdev);
 
 #endif // _USB_CDC_MSC_CORE_H_

@@ -1,3 +1,5 @@
+.. currentmodule:: pyb
+
 class CAN -- controller area network communication bus
 ======================================================
 
@@ -34,7 +36,7 @@ Constructors
 
 Class Methods
 -------------
-.. method:: CAN.initfilterbanks(nr)
+.. classmethod:: CAN.initfilterbanks(nr)
 
    Reset and disable all filter banks and assign how many banks should be available for CAN(1).
 
@@ -46,7 +48,7 @@ Class Methods
 Methods
 -------
 
-.. method:: can.init(mode, extframe=False, prescaler=100, \*, sjw=1, bs1=6, bs2=8)
+.. method:: CAN.init(mode, extframe=False, prescaler=100, \*, sjw=1, bs1=6, bs2=8)
 
    Initialise the CAN bus with the given parameters:
 
@@ -78,11 +80,11 @@ Methods
 
    See page 680 of the STM32F405 datasheet for more details.
 
-.. method:: can.deinit()
+.. method:: CAN.deinit()
 
    Turn off the CAN bus.
 
-.. method:: can.setfilter(bank, mode, fifo, params)
+.. method:: CAN.setfilter(bank, mode, fifo, params, \*, rtr)
 
    Configure a filter bank:
 
@@ -107,36 +109,68 @@ Methods
    |CAN.MASK32 |As with CAN.MASK16 but with only one 32 bit id/mask pair.|
    +-----------+---------------------------------------------------------+
 
-.. method:: can.clearfilter(bank)
+   - ``rtr`` is an array of booleans that states if a filter should accept a
+     remote transmission request message.  If this argument is not given
+     then it defaults to False for all entries.  The length of the array
+     depends on the ``mode`` argument.
+
+   +-----------+----------------------+
+   |``mode``   |length of rtr array   |
+   +===========+======================+
+   |CAN.LIST16 |4                     |
+   +-----------+----------------------+
+   |CAN.LIST32 |2                     |
+   +-----------+----------------------+
+   |CAN.MASK16 |2                     |
+   +-----------+----------------------+
+   |CAN.MASK32 |1                     |
+   +-----------+----------------------+
+
+.. method:: CAN.clearfilter(bank)
 
    Clear and disables a filter bank:
 
    - ``bank`` is the filter bank that is to be cleared.
 
-.. method:: can.any(fifo)
+.. method:: CAN.any(fifo)
 
    Return ``True`` if any message waiting on the FIFO, else ``False``.
 
-.. method:: can.recv(fifo, \*, timeout=5000)
+.. method:: CAN.recv(fifo, \*, timeout=5000)
 
    Receive data on the bus:
 
      - ``fifo`` is an integer, which is the FIFO to receive on
      - ``timeout`` is the timeout in milliseconds to wait for the receive.
 
-   Return value: buffer of data bytes.
+   Return value: A tuple containing four values.
 
-.. method:: can.send(send, addr, \*, timeout=5000)
+     - The id of the message.
+     - A boolean that indicates if the message is an RTR message.
+     - The FMI (Filter Match Index) value.
+     - An array containing the data.
+
+.. method:: CAN.send(data, id, \*, timeout=0, rtr=False)
 
    Send a message on the bus:
 
-     - ``send`` is the data to send (an integer to send, or a buffer object).
-     - ``addr`` is the address to send to
+     - ``data`` is the data to send (an integer to send, or a buffer object).
+     - ``id`` is the id of the message to be sent.
      - ``timeout`` is the timeout in milliseconds to wait for the send.
+     - ``rtr`` is a boolean that specifies if the message shall be sent as
+       a remote transmission request.  If ``rtr`` is True then only the length
+       of ``data`` is used to fill in the DLC slot of the frame; the actual
+       bytes in ``data`` are unused.
+
+     If timeout is 0 the message is placed in a buffer in one of three hardware
+     buffers and the method returns immediately. If all three buffers are in use
+     an exception is thrown. If timeout is not 0, the method waits until the
+     message is transmitted. If the message can't be transmitted within the
+     specified time an exception is thrown.
 
    Return value: ``None``.
 
-.. method:: can.rxcallback(fifo, fun)
+.. method:: CAN.rxcallback(fifo, fun)
 
    Register a function to be called when a message is accepted into a empty fifo:
 

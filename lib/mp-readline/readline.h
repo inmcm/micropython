@@ -29,10 +29,16 @@
 #define CHAR_CTRL_C (3)
 #define CHAR_CTRL_D (4)
 #define CHAR_CTRL_E (5)
+#define CHAR_CTRL_F (6)
+#define CHAR_CTRL_K (11)
+#define CHAR_CTRL_N (14)
+#define CHAR_CTRL_P (16)
+#define CHAR_CTRL_U (21)
 
 void readline_init0(void);
 int readline(vstr_t *line, const char *prompt);
+void readline_push_history(const char *line);
 
-void readline_init(vstr_t *line);
-void readline_note_newline(void);
+void readline_init(vstr_t *line, const char *prompt);
+void readline_note_newline(const char *prompt);
 int readline_process_char(int c);

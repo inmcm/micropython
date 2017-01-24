@@ -9,19 +9,18 @@
 #include "py/runtime.h"
 #include "py/stackctrl.h"
 #include "py/gc.h"
+#include "py/mphal.h"
 #include "gccollect.h"
-#include "pyexec.h"
+#include "lib/utils/pyexec.h"
 #include "readline.h"
 #include "lexermemzip.h"
 
 #include "Arduino.h"
-#include MICROPY_HAL_H
 
 #include "servo.h"
 #include "led.h"
 #include "uart.h"
 #include "pin.h"
-
 
 extern uint32_t _heap_start;
 
@@ -254,6 +253,7 @@ int main(void) {
     #define SCB_CCR_STKALIGN (1 << 9)
     SCB_CCR |= SCB_CCR_STKALIGN;
 
+    mp_stack_ctrl_init();
     mp_stack_set_limit(10240);
 
     pinMode(LED_BUILTIN, OUTPUT);
@@ -301,16 +301,23 @@ soft_reset:
     }
 #endif
 
+#if MICROPY_MODULE_FROZEN
+    pyexec_frozen_module("boot.py");
+#else
     if (!pyexec_file("/boot.py")) {
         flash_error(4);
     }
+#endif
 
     // Turn bootup LED off
     led_state(PYB_LED_BUILTIN, 0);
 
     // run main script
+#if MICROPY_MODULE_FROZEN
+    pyexec_frozen_module("main.py");
+#else
     {
-        vstr_t *vstr = vstr_new();
+        vstr_t *vstr = vstr_new(16);
         vstr_add_str(vstr, "/");
         if (pyb_config_main == MP_OBJ_NULL) {
             vstr_add_str(vstr, "main.py");
@@ -322,6 +329,7 @@ soft_reset:
         }
         vstr_free(vstr);
     }
+#endif
 
     // enter REPL
     // REPL mode can change, or it can request a soft reset

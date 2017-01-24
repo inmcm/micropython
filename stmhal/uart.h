@@ -32,14 +32,8 @@ typedef enum {
     PYB_UART_4 = 4,
     PYB_UART_5 = 5,
     PYB_UART_6 = 6,
-
-#if defined(PYBV10)
-    PYB_UART_XA = 4, // UART4 on X1, X2 = PA0, PA1
-    PYB_UART_XB = 1, // USART1 on X9, X10 = PB6, PB7
-    PYB_UART_YA = 6, // USART6 on Y1, Y2 = PC6, PC7
-    PYB_UART_YB = 3, // USART3 on Y9, Y10 = PB10, PB11
-#endif
-
+    PYB_UART_7 = 7,
+    PYB_UART_8 = 8,
 } pyb_uart_t;
 
 typedef struct _pyb_uart_obj_t pyb_uart_obj_t;
@@ -49,7 +43,7 @@ void uart_init0(void);
 void uart_deinit(void);
 void uart_irq_handler(mp_uint_t uart_id);
 
-bool uart_rx_any(pyb_uart_obj_t *uart_obj);
+mp_uint_t uart_rx_any(pyb_uart_obj_t *uart_obj);
 int uart_rx_char(pyb_uart_obj_t *uart_obj);
 void uart_tx_strn(pyb_uart_obj_t *uart_obj, const char *str, uint len);
 void uart_tx_strn_cooked(pyb_uart_obj_t *uart_obj, const char *str, uint len);

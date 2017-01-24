@@ -34,14 +34,17 @@
 #include "py/runtime.h"
 #include "py/stackctrl.h"
 #include "py/gc.h"
+#include "py/mphal.h"
 
+#include "lib/utils/pyexec.h"
 #include "lib/fatfs/ff.h"
+#include "extmod/fsusermount.h"
 
 #include "systick.h"
 #include "pendsv.h"
 #include "gccollect.h"
 #include "readline.h"
-#include "pyexec.h"
+#include "modmachine.h"
 #include "i2c.h"
 #include "spi.h"
 #include "uart.h"
@@ -60,14 +63,10 @@
 #include "dac.h"
 #include "can.h"
 #include "modnetwork.h"
-#include MICROPY_HAL_H
 
 void SystemClock_Config(void);
 
-static FATFS fatfs0;
-#if MICROPY_HW_HAS_SDCARD
-static FATFS fatfs1;
-#endif
+fs_user_mount_t fs_user_mount_flash;
 
 void flash_error(int n) {
     for (int i = 0; i < n; i++) {
@@ -103,6 +102,7 @@ void NORETURN __fatal_error(const char *msg) {
 
 void nlr_jump_fail(void *val) {
     printf("FATAL: uncaught exception %p\n", val);
+    mp_obj_print_exception(&mp_plat_print, (mp_obj_t)val);
     __fatal_error("");
 }
 
@@ -114,22 +114,32 @@ void MP_WEAK __assert_func(const char *file, int line, const char *func, const c
 }
 #endif
 
-STATIC mp_obj_t pyb_main(mp_obj_t main) {
-    if (MP_OBJ_IS_STR(main)) {
-        MP_STATE_PORT(pyb_config_main) = main;
+STATIC mp_obj_t pyb_main(mp_uint_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_opt, MP_ARG_INT, {.u_int = 0} }
+    };
+
+    if (MP_OBJ_IS_STR(pos_args[0])) {
+        MP_STATE_PORT(pyb_config_main) = pos_args[0];
+
+        // parse args
+        mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+        mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+        MP_STATE_VM(mp_optimise_value) = args[0].u_int;
     }
     return mp_const_none;
 }
-MP_DEFINE_CONST_FUN_OBJ_1(pyb_main_obj, pyb_main);
+MP_DEFINE_CONST_FUN_OBJ_KW(pyb_main_obj, 1, pyb_main);
 
 static const char fresh_boot_py[] =
 "# boot.py -- run on boot-up\r\n"
 "# can run arbitrary Python, but best to keep it minimal\r\n"
 "\r\n"
+"import machine\r\n"
 "import pyb\r\n"
 "#pyb.main('main.py') # main script to run after this one\r\n"
-"#pyb.usb_mode('CDC+MSC') # act as a serial and a storage device\r\n"
-"#pyb.usb_mode('CDC+HID') # act as a serial device and a mouse\r\n"
+"#pyb.usb_mode('VCP+MSC') # act as a serial and a storage device\r\n"
+"#pyb.usb_mode('VCP+HID') # act as a serial device and a mouse\r\n"
 ;
 
 static const char fresh_main_py[] =
@@ -141,7 +151,7 @@ static const char fresh_pybcdc_inf[] =
 ;
 
 static const char fresh_readme_txt[] =
-"This is a Micro Python board\r\n"
+"This is a MicroPython board\r\n"
 "\r\n"
 "You can get started right away by writing your Python code in 'main.py'.\r\n"
 "\r\n"
@@ -155,11 +165,20 @@ static const char fresh_readme_txt[] =
 "Please visit http://micropython.org/help/ for further help.\r\n"
 ;
 
-// we don't make this function static because it needs a lot of stack and we
-// want it to be executed without using stack within main() function
-void init_flash_fs(uint reset_mode) {
+// avoid inlining to avoid stack usage within main()
+MP_NOINLINE STATIC void init_flash_fs(uint reset_mode) {
+    // init the vfs object
+    fs_user_mount_t *vfs = &fs_user_mount_flash;
+    vfs->str = "/flash";
+    vfs->len = 6;
+    vfs->flags = 0;
+    pyb_flash_init_vfs(vfs);
+
+    // put the flash device in slot 0 (it will be unused at this point)
+    MP_STATE_PORT(fs_user_mount)[0] = vfs;
+
     // try to mount the flash
-    FRESULT res = f_mount(&fatfs0, "/flash", 1);
+    FRESULT res = f_mount(&vfs->fatfs, vfs->str, 1);
 
     if (reset_mode == 3 || res == FR_NO_FILESYSTEM) {
         // no filesystem, or asked to reset it, so create a fresh one
@@ -172,7 +191,9 @@ void init_flash_fs(uint reset_mode) {
         if (res == FR_OK) {
             // success creating fresh LFS
         } else {
-            __fatal_error("could not create LFS");
+            printf("PYB: can't create flash filesystem\n");
+            MP_STATE_PORT(fs_user_mount)[0] = NULL;
+            return;
         }
 
         // set label
@@ -202,7 +223,9 @@ void init_flash_fs(uint reset_mode) {
     } else if (res == FR_OK) {
         // mount sucessful
     } else {
-        __fatal_error("could not access LFS");
+        printf("PYB: can't mount flash\n");
+        MP_STATE_PORT(fs_user_mount)[0] = NULL;
+        return;
     }
 
     // The current directory is used as the boot up directory.
@@ -244,83 +267,13 @@ void init_flash_fs(uint reset_mode) {
     }
 }
 
-int main(void) {
-    // TODO disable JTAG
-
-    // Stack limit should be less than real stack size, so we have a chance
-    // to recover from limit hit.  (Limit is measured in bytes.)
-    mp_stack_set_limit((char*)&_ram_end - (char*)&_heap_end - 1024);
-
-    /* STM32F4xx HAL library initialization:
-         - Configure the Flash prefetch, instruction and Data caches
-         - Configure the Systick to generate an interrupt each 1 msec
-         - Set NVIC Group Priority to 4
-         - Global MSP (MCU Support Package) initialization
-       */
-    HAL_Init();
-
-    // set the system clock to be HSE
-    SystemClock_Config();
-
-    // enable GPIO clocks
-    __GPIOA_CLK_ENABLE();
-    __GPIOB_CLK_ENABLE();
-    __GPIOC_CLK_ENABLE();
-    __GPIOD_CLK_ENABLE();
-
-    // enable the CCM RAM
-    __CCMDATARAMEN_CLK_ENABLE();
-
-#if 0
-#if defined(NETDUINO_PLUS_2)
-    {
-        GPIO_InitTypeDef GPIO_InitStructure;
-        GPIO_InitStructure.GPIO_Speed = GPIO_Speed_25MHz;
-        GPIO_InitStructure.GPIO_Mode = GPIO_Mode_OUT;
-        GPIO_InitStructure.GPIO_OType = GPIO_OType_PP;
-        GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_NOPULL;
-
-#if MICROPY_HW_HAS_SDCARD
-        // Turn on the power enable for the sdcard (PB1)
-        GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1;
-        GPIO_Init(GPIOB, &GPIO_InitStructure);
-        GPIO_WriteBit(GPIOB, GPIO_Pin_1, Bit_SET);
-#endif
-
-        // Turn on the power for the 5V on the expansion header (PB2)
-        GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;
-        GPIO_Init(GPIOB, &GPIO_InitStructure);
-        GPIO_WriteBit(GPIOB, GPIO_Pin_2, Bit_SET);
-    }
-#endif
-#endif
-
-    // basic sub-system init
-    pendsv_init();
-    timer_tim3_init();
-    led_init();
-#if MICROPY_HW_HAS_SWITCH
-    switch_init0();
-#endif
-
-#if defined(USE_DEVICE_MODE)
-    // default to internal flash being the usb medium
-    pyb_usb_storage_medium = PYB_USB_STORAGE_MEDIUM_FLASH;
-#endif
-
-    int first_soft_reset = true;
-
-soft_reset:
-
-    // check if user switch held to select the reset mode
-    led_state(1, 0);
-    led_state(2, 1);
-    led_state(3, 0);
-    led_state(4, 0);
-    uint reset_mode = 1;
-
+STATIC uint update_reset_mode(uint reset_mode) {
 #if MICROPY_HW_HAS_SWITCH
     if (switch_get()) {
+
+        // The original method used on the pyboard is appropriate if you have 2
+        // or more LEDs.
+#if defined(MICROPY_HW_LED2)
         for (uint i = 0; i < 3000; i++) {
             if (!switch_get()) {
                 break;
@@ -347,12 +300,121 @@ soft_reset:
             HAL_Delay(50);
         }
         HAL_Delay(400);
+
+#elif defined(MICROPY_HW_LED1)
+
+        // For boards with only a single LED, we'll flash that LED the
+        // appropriate number of times, with a pause between each one
+        for (uint i = 0; i < 10; i++) {
+            led_state(1, 0);
+            for (uint j = 0; j < reset_mode; j++) {
+                if (!switch_get()) {
+                    break;
+                }
+                led_state(1, 1);
+                HAL_Delay(100);
+                led_state(1, 0);
+                HAL_Delay(200);
+            }
+            HAL_Delay(400);
+            if (!switch_get()) {
+                break;
+            }
+            if (++reset_mode > 3) {
+                reset_mode = 1;
+            }
+        }
+        // Flash the selected reset mode
+        for (uint i = 0; i < 2; i++) {
+            for (uint j = 0; j < reset_mode; j++) {
+                led_state(1, 1);
+                HAL_Delay(100);
+                led_state(1, 0);
+                HAL_Delay(200);
+            }
+            HAL_Delay(400);
+        }
+#else
+#error Need a reset mode update method
+#endif
     }
 #endif
+    return reset_mode;
+}
+
+int main(void) {
+    // TODO disable JTAG
+
+    // Stack limit should be less than real stack size, so we have a chance
+    // to recover from limit hit.  (Limit is measured in bytes.)
+    mp_stack_ctrl_init();
+    mp_stack_set_limit((char*)&_ram_end - (char*)&_heap_end - 1024);
+
+    /* STM32F4xx HAL library initialization:
+         - Configure the Flash prefetch, instruction and Data caches
+         - Configure the Systick to generate an interrupt each 1 msec
+         - Set NVIC Group Priority to 4
+         - Global MSP (MCU Support Package) initialization
+       */
+    HAL_Init();
+
+    // set the system clock to be HSE
+    SystemClock_Config();
+
+    // enable GPIO clocks
+    __GPIOA_CLK_ENABLE();
+    __GPIOB_CLK_ENABLE();
+    __GPIOC_CLK_ENABLE();
+    __GPIOD_CLK_ENABLE();
+
+    #if defined(MCU_SERIES_F4) ||  defined(MCU_SERIES_F7)
+        #if defined(__HAL_RCC_DTCMRAMEN_CLK_ENABLE)
+        // The STM32F746 doesn't really have CCM memory, but it does have DTCM,
+        // which behaves more or less like normal SRAM.
+        __HAL_RCC_DTCMRAMEN_CLK_ENABLE();
+        #elif defined(CCMDATARAM_BASE)
+        // enable the CCM RAM
+        __HAL_RCC_CCMDATARAMEN_CLK_ENABLE();
+        #endif
+    #endif
+
+    #if defined(MICROPY_BOARD_EARLY_INIT)
+    MICROPY_BOARD_EARLY_INIT();
+    #endif
+
+    // basic sub-system init
+    pendsv_init();
+    led_init();
+#if MICROPY_HW_HAS_SWITCH
+    switch_init0();
+#endif
+
+#if defined(USE_DEVICE_MODE)
+    // default to internal flash being the usb medium
+    pyb_usb_storage_medium = PYB_USB_STORAGE_MEDIUM_FLASH;
+#endif
+
+    int first_soft_reset = true;
+
+soft_reset:
+
+    // check if user switch held to select the reset mode
+#if defined(MICROPY_HW_LED2)
+    led_state(1, 0);
+    led_state(2, 1);
+#else
+    led_state(1, 1);
+    led_state(2, 0);
+#endif
+    led_state(3, 0);
+    led_state(4, 0);
+    uint reset_mode = update_reset_mode(1);
+
+    machine_init();
 
 #if MICROPY_HW_ENABLE_RTC
     if (first_soft_reset) {
-        rtc_init();
+        rtc_init_start(false);
     }
 #endif
 
@@ -377,20 +439,6 @@ soft_reset:
     mp_obj_list_append(mp_sys_path, MP_OBJ_NEW_QSTR(MP_QSTR__slash_flash_slash_lib));
     mp_obj_list_init(mp_sys_argv, 0);
 
-    // Change #if 0 to #if 1 if you want REPL on UART_6 (or another uart)
-    // as well as on USB VCP
-#if 0
-    {
-        mp_obj_t args[2] = {
-            MP_OBJ_NEW_SMALL_INT(PYB_UART_6),
-            MP_OBJ_NEW_SMALL_INT(115200),
-        };
-        MP_STATE_PORT(pyb_stdio_uart) = pyb_uart_type.make_new((mp_obj_t)&pyb_uart_type, MP_ARRAY_SIZE(args), 0, args);
-    }
-#else
-    MP_STATE_PORT(pyb_stdio_uart) = NULL;
-#endif
-
     // Initialise low-level sub-systems.  Here we need to very basic things like
     // zeroing out memory and resetting any of the sub-systems.  Following this
     // we can run Python scripts (eg boot.py), but anything that is configurable
@@ -401,6 +449,22 @@ soft_reset:
     extint_init0();
     timer_init0();
     uart_init0();
+
+    // Define MICROPY_HW_UART_REPL to be PYB_UART_6 and define
+    // MICROPY_HW_UART_REPL_BAUD in your mpconfigboard.h file if you want a
+    // REPL on a hardware UART as well as on USB VCP
+#if defined(MICROPY_HW_UART_REPL)
+    {
+        mp_obj_t args[2] = {
+            MP_OBJ_NEW_SMALL_INT(MICROPY_HW_UART_REPL),
+            MP_OBJ_NEW_SMALL_INT(MICROPY_HW_UART_REPL_BAUD),
+        };
+        MP_STATE_PORT(pyb_stdio_uart) = pyb_uart_type.make_new((mp_obj_t)&pyb_uart_type, MP_ARRAY_SIZE(args), 0, args);
+    }
+#else
+    MP_STATE_PORT(pyb_stdio_uart) = NULL;
+#endif
+
 #if MICROPY_HW_ENABLE_CAN
     can_init0();
 #endif
@@ -420,9 +484,24 @@ soft_reset:
 #if MICROPY_HW_HAS_SDCARD
     // if an SD card is present then mount it on /sd/
     if (sdcard_is_present()) {
-        FRESULT res = f_mount(&fatfs1, "/sd", 1);
+        // create vfs object
+        fs_user_mount_t *vfs = m_new_obj_maybe(fs_user_mount_t);
+        if (vfs == NULL) {
+            goto no_mem_for_sd;
+        }
+        vfs->str = "/sd";
+        vfs->len = 3;
+        vfs->flags = FSUSER_FREE_OBJ;
+        sdcard_init_vfs(vfs);
+
+        // put the sd device in slot 1 (it will be unused at this point)
+        MP_STATE_PORT(fs_user_mount)[1] = vfs;
+
+        FRESULT res = f_mount(&vfs->fatfs, vfs->str, 1);
         if (res != FR_OK) {
-            printf("[SD] could not mount SD card\n");
+            printf("PYB: can't mount SD card\n");
+            MP_STATE_PORT(fs_user_mount)[1] = NULL;
+            m_del_obj(fs_user_mount_t, vfs);
         } else {
             // TODO these should go before the /flash entries in the path
             mp_obj_list_append(mp_sys_path, MP_OBJ_NEW_QSTR(MP_QSTR__slash_sd));
@@ -444,6 +523,7 @@ soft_reset:
                 f_chdrive("/sd");
             }
         }
+        no_mem_for_sd:;
     }
 #endif
 
@@ -452,7 +532,7 @@ soft_reset:
 
     // run boot.py, if it exists
     // TODO perhaps have pyb.reboot([bootpy]) function to soft-reboot and execute custom boot.py
-    if (reset_mode == 1) {
+    if (reset_mode == 1 || reset_mode == 3) {
         const char *boot_py = "boot.py";
         FRESULT res = f_stat(boot_py, NULL);
         if (res == FR_OK) {
@@ -467,6 +547,12 @@ soft_reset:
     }
 
     // turn boot-up LEDs off
+#if !defined(MICROPY_HW_LED2)
+    // If there is only one LED on the board then it's used to signal boot-up
+    // and so we turn it off here.  Otherwise LED(1) is used to indicate dirty
+    // flash cache and so we shouldn't change its state.
+    led_state(1, 0);
+#endif
     led_state(2, 0);
     led_state(3, 0);
     led_state(4, 0);
@@ -497,12 +583,14 @@ soft_reset:
     dac_init();
 #endif
 
+#if MICROPY_PY_NETWORK
     mod_network_init();
+#endif
 
     // At this point everything is fully configured and initialised.
 
     // Run the main script from the current directory.
-    if (reset_mode == 1 && pyexec_mode_kind == PYEXEC_MODE_FRIENDLY_REPL) {
+    if ((reset_mode == 1 || reset_mode == 3) && pyexec_mode_kind == PYEXEC_MODE_FRIENDLY_REPL) {
         const char *main_py;
         if (MP_STATE_PORT(pyb_config_main) == MP_OBJ_NULL) {
             main_py = "main.py";

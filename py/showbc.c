@@ -32,6 +32,9 @@
 
 #if MICROPY_DEBUG_PRINTERS
 
+// redirect all printfs in this file to the platform print stream
+#define printf(...) mp_printf(&mp_plat_print, __VA_ARGS__)
+
 #define DECODE_UINT { \
     unum = 0; \
     do { \
@@ -40,6 +43,21 @@
 }
 #define DECODE_ULABEL do { unum = (ip[0] | (ip[1] << 8)); ip += 2; } while (0)
 #define DECODE_SLABEL do { unum = (ip[0] | (ip[1] << 8)) - 0x8000; ip += 2; } while (0)
+
+#if MICROPY_PERSISTENT_CODE
+
+#define DECODE_QSTR \
+    qst = ip[0] | ip[1] << 8; \
+    ip += 2;
+#define DECODE_PTR \
+    DECODE_UINT; \
+    unum = mp_showbc_const_table[unum]
+#define DECODE_OBJ \
+    DECODE_UINT; \
+    unum = mp_showbc_const_table[unum]
+
+#else
+
 #define DECODE_QSTR { \
     qst = 0; \
     do { \
@@ -47,25 +65,47 @@
     } while ((*ip++ & 0x80) != 0); \
 }
 #define DECODE_PTR do { \
-    ip = (byte*)(((mp_uint_t)ip + sizeof(mp_uint_t) - 1) & (~(sizeof(mp_uint_t) - 1))); /* align ip */ \
-    unum = *(mp_uint_t*)ip; \
-    ip += sizeof(mp_uint_t); \
+    ip = (byte*)MP_ALIGN(ip, sizeof(void*)); \
+    unum = (uintptr_t)*(void**)ip; \
+    ip += sizeof(void*); \
+} while (0)
+#define DECODE_OBJ do { \
+    ip = (byte*)MP_ALIGN(ip, sizeof(mp_obj_t)); \
+    unum = (mp_uint_t)*(mp_obj_t*)ip; \
+    ip += sizeof(mp_obj_t); \
 } while (0)
 
+#endif
+
 const byte *mp_showbc_code_start;
+const mp_uint_t *mp_showbc_const_table;
 
-void mp_bytecode_print(const void *descr, mp_uint_t n_total_args, const byte *ip, mp_uint_t len) {
+void mp_bytecode_print(const void *descr, const byte *ip, mp_uint_t len, const mp_uint_t *const_table) {
     mp_showbc_code_start = ip;
+    mp_showbc_const_table = const_table;
 
-    // get code info size
+    // get bytecode parameters
+    mp_uint_t n_state = mp_decode_uint(&ip);
+    mp_uint_t n_exc_stack = mp_decode_uint(&ip);
+    /*mp_uint_t scope_flags =*/ ip++;
+    mp_uint_t n_pos_args = *ip++;
+    mp_uint_t n_kwonly_args = *ip++;
+    /*mp_uint_t n_def_pos_args =*/ ip++;
+
     const byte *code_info = ip;
     mp_uint_t code_info_size = mp_decode_uint(&code_info);
     ip += code_info_size;
 
+    #if MICROPY_PERSISTENT_CODE
+    qstr block_name = code_info[0] | (code_info[1] << 8);
+    qstr source_file = code_info[2] | (code_info[3] << 8);
+    code_info += 4;
+    #else
     qstr block_name = mp_decode_uint(&code_info);
     qstr source_file = mp_decode_uint(&code_info);
+    #endif
     printf("File %s, code block '%s' (descriptor: %p, bytecode @%p " UINT_FMT " bytes)\n",
-        qstr_str(source_file), qstr_str(block_name), descr, code_info, len);
+        qstr_str(source_file), qstr_str(block_name), descr, mp_showbc_code_start, len);
 
     // raw bytecode dump
     printf("Raw bytecode (code_info_size=" UINT_FMT ", bytecode_size=" UINT_FMT "):\n", code_info_size, len - code_info_size);
@@ -79,26 +119,21 @@ void mp_bytecode_print(const void *descr, mp_uint_t n_total_args, const byte *ip
 
     // bytecode prelude: arg names (as qstr objects)
     printf("arg names:");
-    for (mp_uint_t i = 0; i < n_total_args; i++) {
-        printf(" %s", qstr_str(MP_OBJ_QSTR_VALUE(*(mp_obj_t*)ip)));
-        ip += sizeof(mp_obj_t);
+    for (mp_uint_t i = 0; i < n_pos_args + n_kwonly_args; i++) {
+        printf(" %s", qstr_str(MP_OBJ_QSTR_VALUE(const_table[i])));
     }
     printf("\n");
 
-    // bytecode prelude: state size and exception stack size; 16 bit uints
-    {
-        uint n_state = mp_decode_uint(&ip);
-        uint n_exc_stack = mp_decode_uint(&ip);
-        printf("(N_STATE %u)\n", n_state);
-        printf("(N_EXC_STACK %u)\n", n_exc_stack);
-    }
+    printf("(N_STATE " UINT_FMT ")\n", n_state);
+    printf("(N_EXC_STACK " UINT_FMT ")\n", n_exc_stack);
+
+    // for printing line number info
+    const byte *bytecode_start = ip;
 
     // bytecode prelude: initialise closed over variables
     {
-        uint n_local = *ip++;
-        printf("(NUM_LOCAL %u)\n", n_local);
-        for (; n_local > 0; n_local--) {
-            uint local_num = *ip++;
+        uint local_num;
+        while ((local_num = *ip++) != 255) {
             printf("(INIT_CELL %u)\n", local_num);
         }
         len -= ip - mp_showbc_code_start;
@@ -106,7 +141,7 @@ void mp_bytecode_print(const void *descr, mp_uint_t n_total_args, const byte *ip
 
     // print out line number info
     {
-        mp_int_t bc = (mp_showbc_code_start + code_info_size) - ip; // start counting from the prelude
+        mp_int_t bc = bytecode_start - ip;
         mp_uint_t source_line = 1;
         printf("  bc=" INT_FMT " line=" UINT_FMT "\n", bc, source_line);
         for (const byte* ci = code_info; *ci;) {
@@ -144,10 +179,6 @@ const byte *mp_bytecode_print_str(const byte *ip) {
             printf("LOAD_CONST_TRUE");
             break;
 
-        case MP_BC_LOAD_CONST_ELLIPSIS:
-            printf("LOAD_CONST_ELLIPSIS");
-            break;
-
         case MP_BC_LOAD_CONST_SMALL_INT: {
             mp_int_t num = 0;
             if ((ip[0] & 0x40) != 0) {
@@ -161,20 +192,15 @@ const byte *mp_bytecode_print_str(const byte *ip) {
             break;
         }
 
-        case MP_BC_LOAD_CONST_BYTES:
-            DECODE_QSTR;
-            printf("LOAD_CONST_BYTES %s", qstr_str(qst));
-            break;
-
         case MP_BC_LOAD_CONST_STRING:
             DECODE_QSTR;
             printf("LOAD_CONST_STRING '%s'", qstr_str(qst));
             break;
 
         case MP_BC_LOAD_CONST_OBJ:
-            DECODE_PTR;
-            printf("LOAD_CONST_OBJ %p=", (void*)unum);
-            mp_obj_print((mp_obj_t)unum, PRINT_REPR);
+            DECODE_OBJ;
+            printf("LOAD_CONST_OBJ %p=", MP_OBJ_TO_PTR(unum));
+            mp_obj_print_helper(&mp_plat_print, (mp_obj_t)unum, PRINT_REPR);
             break;
 
         case MP_BC_LOAD_NULL:
@@ -275,6 +301,11 @@ const byte *mp_bytecode_print_str(const byte *ip) {
             printf("DELETE_NAME %s", qstr_str(qst));
             break;
 
+        case MP_BC_DELETE_GLOBAL:
+            DECODE_QSTR;
+            printf("DELETE_GLOBAL %s", qstr_str(qst));
+            break;
+
         case MP_BC_DUP_TOP:
             printf("DUP_TOP");
             break;
@@ -297,32 +328,32 @@ const byte *mp_bytecode_print_str(const byte *ip) {
 
         case MP_BC_JUMP:
             DECODE_SLABEL;
-            printf("JUMP " UINT_FMT, ip + unum - mp_showbc_code_start);
+            printf("JUMP " UINT_FMT, (mp_uint_t)(ip + unum - mp_showbc_code_start));
             break;
 
         case MP_BC_POP_JUMP_IF_TRUE:
             DECODE_SLABEL;
-            printf("POP_JUMP_IF_TRUE " UINT_FMT, ip + unum - mp_showbc_code_start);
+            printf("POP_JUMP_IF_TRUE " UINT_FMT, (mp_uint_t)(ip + unum - mp_showbc_code_start));
             break;
 
         case MP_BC_POP_JUMP_IF_FALSE:
             DECODE_SLABEL;
-            printf("POP_JUMP_IF_FALSE " UINT_FMT, ip + unum - mp_showbc_code_start);
+            printf("POP_JUMP_IF_FALSE " UINT_FMT, (mp_uint_t)(ip + unum - mp_showbc_code_start));
             break;
 
         case MP_BC_JUMP_IF_TRUE_OR_POP:
             DECODE_SLABEL;
-            printf("JUMP_IF_TRUE_OR_POP " UINT_FMT, ip + unum - mp_showbc_code_start);
+            printf("JUMP_IF_TRUE_OR_POP " UINT_FMT, (mp_uint_t)(ip + unum - mp_showbc_code_start));
             break;
 
         case MP_BC_JUMP_IF_FALSE_OR_POP:
             DECODE_SLABEL;
-            printf("JUMP_IF_FALSE_OR_POP " UINT_FMT, ip + unum - mp_showbc_code_start);
+            printf("JUMP_IF_FALSE_OR_POP " UINT_FMT, (mp_uint_t)(ip + unum - mp_showbc_code_start));
             break;
 
         case MP_BC_SETUP_WITH:
             DECODE_ULABEL; // loop-like labels are always forward
-            printf("SETUP_WITH " UINT_FMT, ip + unum - mp_showbc_code_start);
+            printf("SETUP_WITH " UINT_FMT, (mp_uint_t)(ip + unum - mp_showbc_code_start));
             break;
 
         case MP_BC_WITH_CLEANUP:
@@ -331,18 +362,18 @@ const byte *mp_bytecode_print_str(const byte *ip) {
 
         case MP_BC_UNWIND_JUMP:
             DECODE_SLABEL;
-            printf("UNWIND_JUMP " UINT_FMT " %d", ip + unum - mp_showbc_code_start, *ip);
+            printf("UNWIND_JUMP " UINT_FMT " %d", (mp_uint_t)(ip + unum - mp_showbc_code_start), *ip);
             ip += 1;
             break;
 
         case MP_BC_SETUP_EXCEPT:
             DECODE_ULABEL; // except labels are always forward
-            printf("SETUP_EXCEPT " UINT_FMT, ip + unum - mp_showbc_code_start);
+            printf("SETUP_EXCEPT " UINT_FMT, (mp_uint_t)(ip + unum - mp_showbc_code_start));
             break;
 
         case MP_BC_SETUP_FINALLY:
             DECODE_ULABEL; // except labels are always forward
-            printf("SETUP_FINALLY " UINT_FMT, ip + unum - mp_showbc_code_start);
+            printf("SETUP_FINALLY " UINT_FMT, (mp_uint_t)(ip + unum - mp_showbc_code_start));
             break;
 
         case MP_BC_END_FINALLY:
@@ -359,7 +390,7 @@ const byte *mp_bytecode_print_str(const byte *ip) {
 
         case MP_BC_FOR_ITER:
             DECODE_ULABEL; // the jump offset if iteration finishes; for labels are always forward
-            printf("FOR_ITER " UINT_FMT, ip + unum - mp_showbc_code_start);
+            printf("FOR_ITER " UINT_FMT, (mp_uint_t)(ip + unum - mp_showbc_code_start));
             break;
 
         case MP_BC_POP_BLOCK:
@@ -372,10 +403,6 @@ const byte *mp_bytecode_print_str(const byte *ip) {
             printf("POP_EXCEPT");
             break;
 
-        case MP_BC_NOT:
-            printf("NOT");
-            break;
-
         case MP_BC_BUILD_TUPLE:
             DECODE_UINT;
             printf("BUILD_TUPLE " UINT_FMT, unum);
@@ -384,11 +411,6 @@ const byte *mp_bytecode_print_str(const byte *ip) {
         case MP_BC_BUILD_LIST:
             DECODE_UINT;
             printf("BUILD_LIST " UINT_FMT, unum);
-            break;
-
-        case MP_BC_LIST_APPEND:
-            DECODE_UINT;
-            printf("LIST_APPEND " UINT_FMT, unum);
             break;
 
         case MP_BC_BUILD_MAP:
@@ -400,19 +422,9 @@ const byte *mp_bytecode_print_str(const byte *ip) {
             printf("STORE_MAP");
             break;
 
-        case MP_BC_MAP_ADD:
-            DECODE_UINT;
-            printf("MAP_ADD " UINT_FMT, unum);
-            break;
-
         case MP_BC_BUILD_SET:
             DECODE_UINT;
             printf("BUILD_SET " UINT_FMT, unum);
-            break;
-
-        case MP_BC_SET_ADD:
-            DECODE_UINT;
-            printf("SET_ADD " UINT_FMT, unum);
             break;
 
 #if MICROPY_PY_BUILTINS_SLICE
@@ -422,32 +434,42 @@ const byte *mp_bytecode_print_str(const byte *ip) {
             break;
 #endif
 
+        case MP_BC_STORE_COMP:
+            DECODE_UINT;
+            printf("STORE_COMP " UINT_FMT, unum);
+            break;
+
         case MP_BC_UNPACK_SEQUENCE:
             DECODE_UINT;
             printf("UNPACK_SEQUENCE " UINT_FMT, unum);
             break;
 
+        case MP_BC_UNPACK_EX:
+            DECODE_UINT;
+            printf("UNPACK_EX " UINT_FMT, unum);
+            break;
+
         case MP_BC_MAKE_FUNCTION:
             DECODE_PTR;
-            printf("MAKE_FUNCTION %p", (void*)unum);
+            printf("MAKE_FUNCTION %p", (void*)(uintptr_t)unum);
             break;
 
         case MP_BC_MAKE_FUNCTION_DEFARGS:
             DECODE_PTR;
-            printf("MAKE_FUNCTION_DEFARGS %p", (void*)unum);
+            printf("MAKE_FUNCTION_DEFARGS %p", (void*)(uintptr_t)unum);
             break;
 
         case MP_BC_MAKE_CLOSURE: {
             DECODE_PTR;
             mp_uint_t n_closed_over = *ip++;
-            printf("MAKE_CLOSURE %p " UINT_FMT, (void*)unum, n_closed_over);
+            printf("MAKE_CLOSURE %p " UINT_FMT, (void*)(uintptr_t)unum, n_closed_over);
             break;
         }
 
         case MP_BC_MAKE_CLOSURE_DEFARGS: {
             DECODE_PTR;
             mp_uint_t n_closed_over = *ip++;
-            printf("MAKE_CLOSURE_DEFARGS %p " UINT_FMT, (void*)unum, n_closed_over);
+            printf("MAKE_CLOSURE_DEFARGS %p " UINT_FMT, (void*)(uintptr_t)unum, n_closed_over);
             break;
         }
 
@@ -509,9 +531,9 @@ const byte *mp_bytecode_print_str(const byte *ip) {
                 printf("LOAD_FAST " UINT_FMT, (mp_uint_t)ip[-1] - MP_BC_LOAD_FAST_MULTI);
             } else if (ip[-1] < MP_BC_STORE_FAST_MULTI + 16) {
                 printf("STORE_FAST " UINT_FMT, (mp_uint_t)ip[-1] - MP_BC_STORE_FAST_MULTI);
-            } else if (ip[-1] < MP_BC_UNARY_OP_MULTI + 5) {
+            } else if (ip[-1] < MP_BC_UNARY_OP_MULTI + 7) {
                 printf("UNARY_OP " UINT_FMT, (mp_uint_t)ip[-1] - MP_BC_UNARY_OP_MULTI);
-            } else if (ip[-1] < MP_BC_BINARY_OP_MULTI + 35) {
+            } else if (ip[-1] < MP_BC_BINARY_OP_MULTI + 36) {
                 mp_uint_t op = ip[-1] - MP_BC_BINARY_OP_MULTI;
                 printf("BINARY_OP " UINT_FMT " %s", op, qstr_str(mp_binary_op_method_name[op]));
             } else {

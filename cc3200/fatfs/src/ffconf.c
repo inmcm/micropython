@@ -25,20 +25,18 @@
  */
 
 #include <string.h>
-#include <std.h>
 
-#include "py/mpconfig.h"
-#include "py/misc.h"
-#include "ff.h"
-#include "ffconf.h"
-#include "diskio.h"
+#include "py/mpstate.h"
+#include "lib/fatfs/ff.h"
+#include "lib/fatfs/ffconf.h"
+#include "lib/fatfs/diskio.h"
+#include "moduos.h"
 
 #if _FS_RPATH
 extern BYTE ff_CurrVol;
 #endif
 
 STATIC bool check_path(const TCHAR **path, const char *mount_point_str, mp_uint_t mount_point_len) {
-    stoupper ((char *)(*path));
     if (strncmp(*path, mount_point_str, mount_point_len) == 0) {
         if ((*path)[mount_point_len] == '/') {
             *path += mount_point_len;
@@ -66,32 +64,30 @@ int ff_get_ldnumber (const TCHAR **path) {
     #endif
     }
 
-    if (check_path(path, "/SFLASH", 7)) {
-        return 0;
+    if (check_path(path, "/flash", 6)) {
+        return PD_FLASH;
     }
-#if MICROPY_HW_HAS_SDCARD
-    else if (check_path(path, "/SD", 3)) {
-        return 1;
-    }
-#endif
     else {
-        return -1;
+        for (mp_uint_t i = 0; i < MP_STATE_PORT(mount_obj_list).len; i++) {
+            os_fs_mount_t *mount_obj = ((os_fs_mount_t *)(MP_STATE_PORT(mount_obj_list).items[i]));
+            if (check_path(path, mount_obj->path, mount_obj->pathlen)) {
+                return mount_obj->vol;
+            }
+        }
     }
+
+    return -1;
 }
 
 void ff_get_volname(BYTE vol, TCHAR **dest) {
-#if MICROPY_HW_HAS_SDCARD
-    if (vol == 0)
-#endif
-    {
-        memcpy(*dest, "/SFLASH", 7);
-        *dest += 7;
+    if (vol == PD_FLASH) {
+        memcpy(*dest, "/flash", 6);
+        *dest += 6;
+    } else {
+        os_fs_mount_t *mount_obj;
+        if ((mount_obj = osmount_find_by_volume(vol))) {
+            memcpy(*dest, mount_obj->path, mount_obj->pathlen);
+            *dest += mount_obj->pathlen;
+        }
     }
-#if MICROPY_HW_HAS_SDCARD
-    else
-    {
-        memcpy(*dest, "/SD", 3);
-        *dest += 3;
-    }
-#endif
 }

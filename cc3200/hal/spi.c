@@ -718,7 +718,7 @@ SPIReset(unsigned long ulBase)
 //! - \b SPI_WL_16
 //! - \b SPI_WL_32
 //!
-//! Active state of Chip[ Selece can be defined by:-
+//! Active state of Chip Select can be defined by:-
 //! - \b SPI_CS_ACTIVELOW
 //! - \b SPI_CS_ACTIVEHIGH
 //!
@@ -782,15 +782,9 @@ SPIConfigSetExpClk(unsigned long ulBase,unsigned long ulSPIClk,
   }
 
   //
-  // Mask the configurations and set clock divider granularity
-  // to 1 cycle
+  // set clock divider granularity to 1 cycle
   //
-  ulRegData = (ulRegData & (~(MCSPI_CH0CONF_WL_M |
-                             MCSPI_CH0CONF_EPOL |
-                             MCSPI_CH0CONF_POL  |
-                             MCSPI_CH0CONF_PHA  |
-                             MCSPI_CH0CONF_TURBO ) |
-               MCSPI_CH0CONF_CLKG));
+  ulRegData |= MCSPI_CH0CONF_CLKG;
 
   //
   // Get the divider value
@@ -798,7 +792,7 @@ SPIConfigSetExpClk(unsigned long ulBase,unsigned long ulSPIClk,
   ulDivider = ((ulSPIClk/ulBitRate) - 1);
 
   //
-  // The least significant four bits of the divider is used fo configure
+  // The least significant four bits of the divider is used to configure
   // CLKD in MCSPI_CHCONF next eight least significant bits are used to
   // configure the EXTCLK in MCSPI_CHCTRL
   //

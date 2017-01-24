@@ -31,13 +31,13 @@
 
 #include "py/obj.h"
 #include "py/gc.h"
+#include "py/mphal.h"
 
-#include "teensy_hal.h"
+#include "lib/utils/pyexec.h"
 
 #include "gccollect.h"
 #include "irq.h"
 #include "systick.h"
-#include "pyexec.h"
 #include "led.h"
 #include "pin.h"
 #include "timer.h"
@@ -161,7 +161,7 @@ STATIC mp_obj_t pyb_millis(void) {
     // We want to "cast" the 32 bit unsigned into a small-int.  This means
     // copying the MSB down 1 bit (extending the sign down), which is
     // equivalent to just using the MP_OBJ_NEW_SMALL_INT macro.
-    return MP_OBJ_NEW_SMALL_INT(HAL_GetTick());
+    return MP_OBJ_NEW_SMALL_INT(mp_hal_ticks_ms());
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_0(pyb_millis_obj, pyb_millis);
 
@@ -177,7 +177,7 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_0(pyb_millis_obj, pyb_millis);
 ///         # Perform some operation
 STATIC mp_obj_t pyb_elapsed_millis(mp_obj_t start) {
     uint32_t startMillis = mp_obj_get_int(start);
-    uint32_t currMillis = HAL_GetTick();
+    uint32_t currMillis = mp_hal_ticks_ms();
     return MP_OBJ_NEW_SMALL_INT((currMillis - startMillis) & 0x3fffffff);
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(pyb_elapsed_millis_obj, pyb_elapsed_millis);
@@ -218,7 +218,7 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_1(pyb_elapsed_micros_obj, pyb_elapsed_micros);
 STATIC mp_obj_t pyb_delay(mp_obj_t ms_in) {
     mp_int_t ms = mp_obj_get_int(ms_in);
     if (ms >= 0) {
-        HAL_Delay(ms);
+        mp_hal_delay_ms(ms);
     }
     return mp_const_none;
 }
@@ -248,7 +248,7 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_0(pyb_standby_obj, pyb_standby);
 /// \function have_cdc()
 /// Return True if USB is connected as a serial device, False otherwise.
 STATIC mp_obj_t pyb_have_cdc(void ) {
-    return MP_BOOL(usb_vcp_is_connected());
+    return mp_obj_new_bool(usb_vcp_is_connected());
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_0(pyb_have_cdc_obj, pyb_have_cdc);
 
@@ -272,9 +272,9 @@ STATIC mp_obj_t pyb_hid_send_report(mp_obj_t arg) {
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(pyb_hid_send_report_obj, pyb_hid_send_report);
 
-MP_DECLARE_CONST_FUN_OBJ(pyb_source_dir_obj); // defined in main.c
-MP_DECLARE_CONST_FUN_OBJ(pyb_main_obj); // defined in main.c
-MP_DECLARE_CONST_FUN_OBJ(pyb_usb_mode_obj); // defined in main.c
+MP_DECLARE_CONST_FUN_OBJ_1(pyb_source_dir_obj); // defined in main.c
+MP_DECLARE_CONST_FUN_OBJ_1(pyb_main_obj); // defined in main.c
+MP_DECLARE_CONST_FUN_OBJ_1(pyb_usb_mode_obj); // defined in main.c
 
 STATIC const mp_map_elem_t pyb_module_globals_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR___name__), MP_OBJ_NEW_QSTR(MP_QSTR_pyb) },
@@ -354,6 +354,5 @@ STATIC MP_DEFINE_CONST_DICT(pyb_module_globals, pyb_module_globals_table);
 
 const mp_obj_module_t pyb_module = {
     .base = { &mp_type_module },
-    .name = MP_QSTR_pyb,
     .globals = (mp_obj_dict_t*)&pyb_module_globals,
 };

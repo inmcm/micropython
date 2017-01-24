@@ -159,7 +159,7 @@ unsigned char ulRstReg;
 #define PRCM_HIB_WAKEUP_CAUSE_GPIO        0x00000004
 
 //*****************************************************************************
-// Values that can be passed to PRCMSEnableInterrupt
+// Values that can be passed to PRCMIntEnable
 //*****************************************************************************
 #define PRCM_INT_SLOW_CLK_CTR     0x00004000
 
@@ -193,16 +193,20 @@ unsigned char ulRstReg;
 #define PRCM_ADC                  0x000000FF 
 
 //*****************************************************************************
+// User bits in the PRCM persistent registers
+//*****************************************************************************
+#define PRCM_SAFE_BOOT_BIT              30
+#define PRCM_WDT_RESET_BIT              29
+#define PRCM_FIRST_BOOT_BIT             28
+
+//*****************************************************************************
 //
 // API Function prototypes
 //
 //*****************************************************************************
-extern void PRCMRequestSafeBoot(void);
-extern void PRCMClearSafeBootRequest(void);
-extern tBoolean PRCMIsSafeBootRequested(void);
-extern void PRCMSignalWDTReset(void);
-extern void PRCMClearWDTResetSignal(void);
-extern tBoolean PRCMWasResetBecauseOfWDT(void);
+extern void PRCMSetSpecialBit(unsigned char bit);
+extern void PRCMClearSpecialBit(unsigned char bit);
+extern tBoolean PRCMGetSpecialBit(unsigned char bit);
 extern void PRCMSOCReset(void);
 extern void PRCMMCUReset(tBoolean bIncludeSubsystem);
 extern unsigned long PRCMSysResetCauseGet(void);
@@ -243,6 +247,7 @@ extern void PRCMHibernateWakeupSourceDisable(unsigned long ulHIBWakupSrc);
 extern void PRCMHibernateIntervalSet(unsigned long long ullTicks);
 
 extern unsigned long long PRCMSlowClkCtrGet(void);
+extern unsigned long long PRCMSlowClkCtrFastGet(void);
 extern void PRCMSlowClkCtrMatchSet(unsigned long long ullTicks);
 extern unsigned long long PRCMSlowClkCtrMatchGet(void);
 
@@ -265,6 +270,7 @@ extern void PRCMRTCMatchGet(unsigned long *ulSecs, unsigned short *usMsec);
 extern void PRCMCC3200MCUInit(void);
 extern unsigned long PRCMHIBRegRead(unsigned long ulRegAddr);
 extern void PRCMHIBRegWrite(unsigned long ulRegAddr, unsigned long ulValue);
+extern unsigned long PRCMCameraFreqSet(unsigned char ulDivider, unsigned char ulWidth);
 
 
 //*****************************************************************************

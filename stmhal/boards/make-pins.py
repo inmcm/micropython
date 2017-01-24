@@ -11,9 +11,18 @@ SUPPORTED_FN = {
     'TIM'   : ['CH1',  'CH2',  'CH3',  'CH4',
                'CH1N', 'CH2N', 'CH3N', 'CH1_ETR', 'ETR', 'BKIN'],
     'I2C'   : ['SDA', 'SCL'],
+    'I2S'   : ['CK', 'MCK', 'SD', 'WS', 'EXTSD'],
     'USART' : ['RX', 'TX', 'CTS', 'RTS', 'CK'],
     'UART'  : ['RX', 'TX', 'CTS', 'RTS'],
     'SPI'   : ['NSS', 'SCK', 'MISO', 'MOSI']
+}
+
+CONDITIONAL_VAR = {
+    'I2C'   : 'MICROPY_HW_I2C{num}_SCL',
+    'I2S'   : 'MICROPY_HW_ENABLE_I2S{num}',
+    'SPI'   : 'MICROPY_HW_SPI{num}_SCK',
+    'UART'  : 'MICROPY_HW_UART{num}_TX',
+    'USART' : 'MICROPY_HW_UART{num}_TX',
 }
 
 def parse_port_pin(name_str):
@@ -22,8 +31,8 @@ def parse_port_pin(name_str):
         raise ValueError("Expecting pin name to be at least 3 charcters.")
     if name_str[0] != 'P':
         raise ValueError("Expecting pin name to start with P")
-    if name_str[1] < 'A' or name_str[1] > 'J':
-        raise ValueError("Expecting pin port to be between A and J")
+    if name_str[1] < 'A' or name_str[1] > 'K':
+        raise ValueError("Expecting pin port to be between A and K")
     port = ord(name_str[1]) - ord('A')
     pin_str = name_str[2:]
     if not pin_str.isdigit():
@@ -41,12 +50,41 @@ def split_name_num(name_num):
             break
     return name, num
 
+def conditional_var(name_num):
+    # Try the specific instance first. For example, if name_num is UART4_RX
+    # then try UART4 first, and then try UART second.
+    name, num = split_name_num(name_num)
+    var = []
+    if name in CONDITIONAL_VAR:
+        var.append(CONDITIONAL_VAR[name].format(num=num))
+    if name_num in CONDITIONAL_VAR:
+        var.append(CONDITIONAL_VAR[name_num])
+    return var
+
+def print_conditional_if(cond_var, file=None):
+    if cond_var:
+        cond_str = []
+        for var in cond_var:
+            if var.find('ENABLE') >= 0:
+                cond_str.append('(defined({0}) && {0})'.format(var))
+            else:
+                cond_str.append('defined({0})'.format(var))
+        print('#if ' + ' || '.join(cond_str), file=file)
+
+def print_conditional_endif(cond_var, file=None):
+    if cond_var:
+        print('#endif', file=file)
+
 
 class AlternateFunction(object):
     """Holds the information associated with a pins alternate function."""
 
     def __init__(self, idx, af_str):
         self.idx = idx
+        # Special case. We change I2S2ext_SD into I2S2_EXTSD so that it parses
+        # the same way the other peripherals do.
+        af_str = af_str.replace('ext_', '_EXT')
+
         self.af_str = af_str
 
         self.func = ''
@@ -77,7 +115,10 @@ class AlternateFunction(object):
 
     def print(self):
         """Prints the C representation of this AF."""
+        cond_var = None
         if self.supported:
+            cond_var = conditional_var('{}{}'.format(self.func, self.fn_num))
+            print_conditional_if(cond_var)
             print('  AF',  end='')
         else:
             print('  //', end='')
@@ -86,6 +127,7 @@ class AlternateFunction(object):
             fn_num = 0
         print('({:2d}, {:8s}, {:2d}, {:10s}, {:8s}), // {:s}'.format(self.idx,
               self.func, fn_num, self.pin_type, self.ptr(), self.af_str))
+        print_conditional_endif(cond_var)
 
     def qstr_list(self):
         return [self.mux_name()]
@@ -163,9 +205,9 @@ class Pin(object):
             print("// ",  end='')
         print('};')
         print('')
-        print('const pin_obj_t pin_{:s} = PIN({:s}, {:d}, {:d}, {:s}, {:s}, {:d});'.format(
+        print('const pin_obj_t pin_{:s} = PIN({:s}, {:d}, {:s}, {:s}, {:d});'.format(
             self.cpu_pin_name(), self.port_letter(), self.pin,
-            self.alt_fn_count, self.alt_fn_name(null_if_0=True),
+            self.alt_fn_name(null_if_0=True),
             self.adc_num_str(), self.adc_channel))
         print('')
 
@@ -259,7 +301,9 @@ class Pins(object):
     def print_adc(self, adc_num):
         print('');
         print('const pin_obj_t * const pin_adc{:d}[] = {{'.format(adc_num))
-        for channel in range(16):
+        for channel in range(17):
+            if channel == 16:
+                print('#if defined(MCU_SERIES_L4)')
             adc_found = False
             for named_pin in self.cpu_pins:
                 pin = named_pin.pin()
@@ -270,6 +314,8 @@ class Pins(object):
                     break
             if not adc_found:
                 print('  NULL,    // {:d}'.format(channel))
+            if channel == 16:
+                print('#endif')
         print('};')
 
 
@@ -282,6 +328,9 @@ class Pins(object):
             hdr_file.write('extern const pin_obj_t * const pin_adc1[];\n')
             hdr_file.write('extern const pin_obj_t * const pin_adc2[];\n')
             hdr_file.write('extern const pin_obj_t * const pin_adc3[];\n')
+            # provide #define's mapping board to cpu name
+            for named_pin in self.board_pins:
+                hdr_file.write("#define pyb_pin_{:s} pin_{:s}\n".format(named_pin.name(), named_pin.pin().cpu_pin_name()))
 
     def print_qstr(self, qstr_filename):
         with open(qstr_filename, 'wt') as qstr_file:
@@ -294,7 +343,13 @@ class Pins(object):
             for named_pin in self.board_pins:
                 qstr_set |= set([named_pin.name()])
             for qstr in sorted(qstr_set):
+                cond_var = None
+                if qstr.startswith('AF'):
+                    af_words = qstr.split('_')
+                    cond_var = conditional_var(af_words[1])
+                    print_conditional_if(cond_var, file=qstr_file)
                 print('Q({})'.format(qstr), file=qstr_file)
+                print_conditional_endif(cond_var, file=qstr_file)
 
     def print_af_hdr(self, af_const_filename):
         with open(af_const_filename,  'wt') as af_const_file:
@@ -310,10 +365,14 @@ class Pins(object):
                             if len(mux_name) > mux_name_width:
                                 mux_name_width = len(mux_name)
             for mux_name in sorted(af_hdr_set):
+                af_words = mux_name.split('_')  # ex mux_name: AF9_I2C2
+                cond_var = conditional_var(af_words[1])
+                print_conditional_if(cond_var, file=af_const_file)
                 key = 'MP_OBJ_NEW_QSTR(MP_QSTR_{}),'.format(mux_name)
                 val = 'MP_OBJ_NEW_SMALL_INT(GPIO_{})'.format(mux_name)
                 print('    { %-*s %s },' % (mux_name_width + 26, key, val),
                       file=af_const_file)
+                print_conditional_endif(cond_var, file=af_const_file)
 
     def print_af_py(self, af_py_filename):
         with open(af_py_filename,  'wt') as af_py_file:

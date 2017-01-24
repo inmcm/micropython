@@ -26,35 +26,45 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 #include "py/mpconfig.h"
 #include "py/misc.h"
-#include "py/obj.h"
+#include "py/runtime0.h"
+#include "py/runtime.h"
 
 // Fixed empty map. Useful when need to call kw-receiving functions
 // without any keywords from C, etc.
 const mp_map_t mp_const_empty_map = {
     .all_keys_are_qstrs = 0,
-    .table_is_fixed_array = 1,
+    .is_fixed = 1,
+    .is_ordered = 1,
     .used = 0,
     .alloc = 0,
     .table = NULL,
 };
 
-// approximatelly doubling primes; made with Mathematica command: Table[Prime[Floor[(1.7)^n]], {n, 3, 24}]
-// prefixed with zero for the empty case.
-STATIC uint32_t doubling_primes[] = {0, 7, 19, 43, 89, 179, 347, 647, 1229, 2297, 4243, 7829, 14347, 26017, 47149, 84947, 152443, 273253, 488399, 869927, 1547173, 2745121, 4861607};
+// This table of sizes is used to control the growth of hash tables.
+// The first set of sizes are chosen so the allocation fits exactly in a
+// 4-word GC block, and it's not so important for these small values to be
+// prime.  The latter sizes are prime and increase at an increasing rate.
+STATIC const uint16_t hash_allocation_sizes[] = {
+    0, 2, 4, 6, 8, 10, 12, // +2
+    17, 23, 29, 37, 47, 59, 73, // *1.25
+    97, 127, 167, 223, 293, 389, 521, 691, 919, 1223, 1627, 2161, // *1.33
+    3229, 4831, 7243, 10861, 16273, 24407, 36607, 54907, // *1.5
+};
 
-STATIC mp_uint_t get_doubling_prime_greater_or_equal_to(mp_uint_t x) {
-    for (size_t i = 0; i < MP_ARRAY_SIZE(doubling_primes); i++) {
-        if (doubling_primes[i] >= x) {
-            return doubling_primes[i];
+STATIC mp_uint_t get_hash_alloc_greater_or_equal_to(mp_uint_t x) {
+    for (size_t i = 0; i < MP_ARRAY_SIZE(hash_allocation_sizes); i++) {
+        if (hash_allocation_sizes[i] >= x) {
+            return hash_allocation_sizes[i];
         }
     }
     // ran out of primes in the table!
     // return something sensible, at least make it odd
-    return x | 1;
+    return (x + x / 2) | 1;
 }
 
 /******************************************************************************/
@@ -70,14 +80,16 @@ void mp_map_init(mp_map_t *map, mp_uint_t n) {
     }
     map->used = 0;
     map->all_keys_are_qstrs = 1;
-    map->table_is_fixed_array = 0;
+    map->is_fixed = 0;
+    map->is_ordered = 0;
 }
 
 void mp_map_init_fixed_table(mp_map_t *map, mp_uint_t n, const mp_obj_t *table) {
     map->alloc = n;
     map->used = n;
     map->all_keys_are_qstrs = 1;
-    map->table_is_fixed_array = 1;
+    map->is_fixed = 1;
+    map->is_ordered = 1;
     map->table = (mp_map_elem_t*)table;
 }
 
@@ -89,7 +101,7 @@ mp_map_t *mp_map_new(mp_uint_t n) {
 
 // Differentiate from mp_map_clear() - semantics is different
 void mp_map_deinit(mp_map_t *map) {
-    if (!map->table_is_fixed_array) {
+    if (!map->is_fixed) {
         m_del(mp_map_elem_t, map->table, map->alloc);
     }
     map->used = map->alloc = 0;
@@ -101,23 +113,26 @@ void mp_map_free(mp_map_t *map) {
 }
 
 void mp_map_clear(mp_map_t *map) {
-    if (!map->table_is_fixed_array) {
+    if (!map->is_fixed) {
         m_del(mp_map_elem_t, map->table, map->alloc);
     }
     map->alloc = 0;
     map->used = 0;
     map->all_keys_are_qstrs = 1;
-    map->table_is_fixed_array = 0;
+    map->is_fixed = 0;
     map->table = NULL;
 }
 
 STATIC void mp_map_rehash(mp_map_t *map) {
     mp_uint_t old_alloc = map->alloc;
+    mp_uint_t new_alloc = get_hash_alloc_greater_or_equal_to(map->alloc + 1);
     mp_map_elem_t *old_table = map->table;
-    map->alloc = get_doubling_prime_greater_or_equal_to(map->alloc + 1);
+    mp_map_elem_t *new_table = m_new0(mp_map_elem_t, new_alloc);
+    // If we reach this point, table resizing succeeded, now we can edit the old map.
+    map->alloc = new_alloc;
     map->used = 0;
     map->all_keys_are_qstrs = 1;
-    map->table = m_new0(mp_map_elem_t, map->alloc);
+    map->table = new_table;
     for (mp_uint_t i = 0; i < old_alloc; i++) {
         if (old_table[i].key != MP_OBJ_NULL && old_table[i].key != MP_OBJ_SENTINEL) {
             mp_map_lookup(map, old_table[i].key, MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)->value = old_table[i].value;
@@ -132,7 +147,12 @@ STATIC void mp_map_rehash(mp_map_t *map) {
 //  - returns slot, with key non-null and value=MP_OBJ_NULL if it was added
 // MP_MAP_LOOKUP_REMOVE_IF_FOUND behaviour:
 //  - returns NULL if not found, else the slot if was found in with key null and value non-null
-mp_map_elem_t* mp_map_lookup(mp_map_t *map, mp_obj_t index, mp_map_lookup_kind_t lookup_kind) {
+mp_map_elem_t *mp_map_lookup(mp_map_t *map, mp_obj_t index, mp_map_lookup_kind_t lookup_kind) {
+
+    if (map->is_fixed && lookup_kind != MP_MAP_LOOKUP) {
+        // can't add/remove from a fixed array
+        return NULL;
+    }
 
     // Work out if we can compare just pointers
     bool compare_only_ptrs = map->all_keys_are_qstrs;
@@ -146,37 +166,60 @@ mp_map_elem_t* mp_map_lookup(mp_map_t *map, mp_obj_t index, mp_map_lookup_kind_t
             // and it won't necessarily benefit subsequent calls because these calls
             // most likely won't pass the newly-interned string.
             compare_only_ptrs = false;
-        } else if (!(lookup_kind & MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)) {
+        } else if (lookup_kind != MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
             // If we are not adding, then we can return straight away a failed
             // lookup because we know that the index will never be found.
             return NULL;
         }
     }
 
-    // if the map is a fixed array then we must do a brute force linear search
-    if (map->table_is_fixed_array) {
-        if (lookup_kind != MP_MAP_LOOKUP) {
-            return NULL;
-        }
+    // if the map is an ordered array then we must do a brute force linear search
+    if (map->is_ordered) {
         for (mp_map_elem_t *elem = &map->table[0], *top = &map->table[map->used]; elem < top; elem++) {
             if (elem->key == index || (!compare_only_ptrs && mp_obj_equal(elem->key, index))) {
+                if (MP_UNLIKELY(lookup_kind == MP_MAP_LOOKUP_REMOVE_IF_FOUND)) {
+                    elem->key = MP_OBJ_SENTINEL;
+                    // keep elem->value so that caller can access it if needed
+                }
                 return elem;
             }
         }
-        return NULL;
+        if (MP_LIKELY(lookup_kind != MP_MAP_LOOKUP_ADD_IF_NOT_FOUND)) {
+            return NULL;
+        }
+        // TODO shrink array down over any previously-freed slots
+        if (map->used == map->alloc) {
+            // TODO: Alloc policy
+            map->alloc += 4;
+            map->table = m_renew(mp_map_elem_t, map->table, map->used, map->alloc);
+            mp_seq_clear(map->table, map->used, map->alloc, sizeof(*map->table));
+        }
+        mp_map_elem_t *elem = map->table + map->used++;
+        elem->key = index;
+        if (!MP_OBJ_IS_QSTR(index)) {
+            map->all_keys_are_qstrs = 0;
+        }
+        return elem;
     }
 
-    // map is a hash table (not a fixed array), so do a hash lookup
+    // map is a hash table (not an ordered array), so do a hash lookup
 
     if (map->alloc == 0) {
-        if (lookup_kind & MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
+        if (lookup_kind == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
             mp_map_rehash(map);
         } else {
             return NULL;
         }
     }
 
-    mp_uint_t hash = mp_obj_hash(index);
+    // get hash of index, with fast path for common case of qstr
+    mp_uint_t hash;
+    if (MP_OBJ_IS_QSTR(index)) {
+        hash = qstr_hash(MP_OBJ_QSTR_VALUE(index));
+    } else {
+        hash = MP_OBJ_SMALL_INT_VALUE(mp_unary_op(MP_UNARY_OP_HASH, index));
+    }
+
     mp_uint_t pos = hash % map->alloc;
     mp_uint_t start_pos = pos;
     mp_map_elem_t *avail_slot = NULL;
@@ -184,17 +227,17 @@ mp_map_elem_t* mp_map_lookup(mp_map_t *map, mp_obj_t index, mp_map_lookup_kind_t
         mp_map_elem_t *slot = &map->table[pos];
         if (slot->key == MP_OBJ_NULL) {
             // found NULL slot, so index is not in table
-            if (lookup_kind & MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
+            if (lookup_kind == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
                 map->used += 1;
                 if (avail_slot == NULL) {
                     avail_slot = slot;
                 }
-                slot->key = index;
-                slot->value = MP_OBJ_NULL;
+                avail_slot->key = index;
+                avail_slot->value = MP_OBJ_NULL;
                 if (!MP_OBJ_IS_QSTR(index)) {
                     map->all_keys_are_qstrs = 0;
                 }
-                return slot;
+                return avail_slot;
             } else {
                 return NULL;
             }
@@ -206,7 +249,7 @@ mp_map_elem_t* mp_map_lookup(mp_map_t *map, mp_obj_t index, mp_map_lookup_kind_t
         } else if (slot->key == index || (!compare_only_ptrs && mp_obj_equal(slot->key, index))) {
             // found index
             // Note: CPython does not replace the index; try x={True:'true'};x[1]='one';x
-            if (lookup_kind & MP_MAP_LOOKUP_REMOVE_IF_FOUND) {
+            if (lookup_kind == MP_MAP_LOOKUP_REMOVE_IF_FOUND) {
                 // delete element in this slot
                 map->used--;
                 if (map->table[(pos + 1) % map->alloc].key == MP_OBJ_NULL) {
@@ -225,7 +268,7 @@ mp_map_elem_t* mp_map_lookup(mp_map_t *map, mp_obj_t index, mp_map_lookup_kind_t
 
         if (pos == start_pos) {
             // search got back to starting position, so index is not in table
-            if (lookup_kind & MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
+            if (lookup_kind == MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
                 if (avail_slot != NULL) {
                     // there was an available slot, so use that
                     map->used++;
@@ -262,7 +305,7 @@ void mp_set_init(mp_set_t *set, mp_uint_t n) {
 STATIC void mp_set_rehash(mp_set_t *set) {
     mp_uint_t old_alloc = set->alloc;
     mp_obj_t *old_table = set->table;
-    set->alloc = get_doubling_prime_greater_or_equal_to(set->alloc + 1);
+    set->alloc = get_hash_alloc_greater_or_equal_to(set->alloc + 1);
     set->used = 0;
     set->table = m_new0(mp_obj_t, set->alloc);
     for (mp_uint_t i = 0; i < old_alloc; i++) {
@@ -274,14 +317,17 @@ STATIC void mp_set_rehash(mp_set_t *set) {
 }
 
 mp_obj_t mp_set_lookup(mp_set_t *set, mp_obj_t index, mp_map_lookup_kind_t lookup_kind) {
+    // Note: lookup_kind can be MP_MAP_LOOKUP_ADD_IF_NOT_FOUND_OR_REMOVE_IF_FOUND which
+    // is handled by using bitwise operations.
+
     if (set->alloc == 0) {
         if (lookup_kind & MP_MAP_LOOKUP_ADD_IF_NOT_FOUND) {
             mp_set_rehash(set);
         } else {
-            return NULL;
+            return MP_OBJ_NULL;
         }
     }
-    mp_uint_t hash = mp_obj_hash(index);
+    mp_uint_t hash = MP_OBJ_SMALL_INT_VALUE(mp_unary_op(MP_UNARY_OP_HASH, index));
     mp_uint_t pos = hash % set->alloc;
     mp_uint_t start_pos = pos;
     mp_obj_t *avail_slot = NULL;

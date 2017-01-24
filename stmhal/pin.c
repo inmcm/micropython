@@ -30,7 +30,7 @@
 
 #include "py/nlr.h"
 #include "py/runtime.h"
-#include MICROPY_HAL_H
+#include "py/mphal.h"
 #include "pin.h"
 
 /// \moduleref pyb
@@ -180,17 +180,17 @@ const pin_obj_t *pin_find(mp_obj_t user_obj) {
 
 /// \method __str__()
 /// Return a string describing the pin object.
-STATIC void pin_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+STATIC void pin_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     pin_obj_t *self = self_in;
 
     // pin name
-    print(env, "Pin(Pin.cpu.%s, mode=Pin.", qstr_str(self->name));
+    mp_printf(print, "Pin(Pin.cpu.%q, mode=Pin.", self->name);
 
     uint32_t mode = pin_get_mode(self);
 
     if (mode == GPIO_MODE_ANALOG) {
         // analog
-        print(env, "ANALOG)");
+        mp_print_str(print, "ANALOG)");
 
     } else {
         // IO mode
@@ -199,18 +199,18 @@ STATIC void pin_print(void (*print)(void *env, const char *fmt, ...), void *env,
         if (mode == GPIO_MODE_INPUT) {
             mode_qst = MP_QSTR_IN;
         } else if (mode == GPIO_MODE_OUTPUT_PP) {
-            mode_qst = MP_QSTR_OUT_PP;
+            mode_qst = MP_QSTR_OUT;
         } else if (mode == GPIO_MODE_OUTPUT_OD) {
-            mode_qst = MP_QSTR_OUT_OD;
+            mode_qst = MP_QSTR_OPEN_DRAIN;
         } else {
             af = true;
             if (mode == GPIO_MODE_AF_PP) {
-                mode_qst = MP_QSTR_AF_PP;
+                mode_qst = MP_QSTR_ALT;
             } else {
-                mode_qst = MP_QSTR_AF_OD;
+                mode_qst = MP_QSTR_ALT_OPEN_DRAIN;
             }
         }
-        print(env, qstr_str(mode_qst)); // safe because mode_qst has no formating chars
+        mp_print_str(print, qstr_str(mode_qst));
 
         // pull mode
         qstr pull_qst = MP_QSTR_NULL;
@@ -221,7 +221,7 @@ STATIC void pin_print(void (*print)(void *env, const char *fmt, ...), void *env,
             pull_qst = MP_QSTR_PULL_DOWN;
         }
         if (pull_qst != MP_QSTR_NULL) {
-            print(env, ", pull=Pin.%s", qstr_str(pull_qst));
+            mp_printf(print, ", pull=Pin.%q", pull_qst);
         }
 
         // AF mode
@@ -229,12 +229,12 @@ STATIC void pin_print(void (*print)(void *env, const char *fmt, ...), void *env,
             mp_uint_t af_idx = pin_get_af(self);
             const pin_af_obj_t *af_obj = pin_find_af_by_index(self, af_idx);
             if (af_obj == NULL) {
-                print(env, ", af=%d)", af_idx);
+                mp_printf(print, ", af=%d)", af_idx);
             } else {
-                print(env, ", af=Pin.%s)", qstr_str(af_obj->name));
+                mp_printf(print, ", af=Pin.%q)", af_obj->name);
             }
         } else {
-            print(env, ")");
+            mp_print_str(print, ")");
         }
     }
 }
@@ -244,7 +244,7 @@ STATIC mp_obj_t pin_obj_init_helper(const pin_obj_t *pin, mp_uint_t n_args, cons
 /// \classmethod \constructor(id, ...)
 /// Create a new Pin object associated with the id.  If additional arguments are given,
 /// they are used to initialise the pin.  See `init`.
-STATIC mp_obj_t pin_make_new(mp_obj_t self_in, mp_uint_t n_args, mp_uint_t n_kw, const mp_obj_t *args) {
+STATIC mp_obj_t pin_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     mp_arg_check_num(n_args, n_kw, 1, MP_OBJ_FUN_ARGS_MAX, true);
 
     // Run an argument through the mapper and return the result.
@@ -258,6 +258,20 @@ STATIC mp_obj_t pin_make_new(mp_obj_t self_in, mp_uint_t n_args, mp_uint_t n_kw,
     }
 
     return (mp_obj_t)pin;
+}
+
+// fast method for getting/setting pin value
+STATIC mp_obj_t pin_call(mp_obj_t self_in, size_t n_args, size_t n_kw, const mp_obj_t *args) {
+    mp_arg_check_num(n_args, n_kw, 0, 1, false);
+    pin_obj_t *self = self_in;
+    if (n_args == 0) {
+        // get pin
+        return MP_OBJ_NEW_SMALL_INT(mp_hal_pin_read(self));
+    } else {
+        // set pin
+        mp_hal_pin_write(self, mp_obj_is_true(args[0]));
+        return mp_const_none;
+    }
 }
 
 /// \classmethod mapper([fun])
@@ -305,91 +319,55 @@ STATIC mp_obj_t pin_debug(mp_uint_t n_args, const mp_obj_t *args) {
         pin_class_debug = mp_obj_is_true(args[1]);
         return mp_const_none;
     }
-    return MP_BOOL(pin_class_debug);
+    return mp_obj_new_bool(pin_class_debug);
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(pin_debug_fun_obj, 1, 2, pin_debug);
 STATIC MP_DEFINE_CONST_CLASSMETHOD_OBJ(pin_debug_obj, (mp_obj_t)&pin_debug_fun_obj);
 
-/// \method init(mode, pull=Pin.PULL_NONE, af=-1)
-/// Initialise the pin:
-///
-///   - `mode` can be one of:
-///     - `Pin.IN` - configure the pin for input;
-///     - `Pin.OUT_PP` - configure the pin for output, with push-pull control;
-///     - `Pin.OUT_OD` - configure the pin for output, with open-drain control;
-///     - `Pin.AF_PP` - configure the pin for alternate function, pull-pull;
-///     - `Pin.AF_OD` - configure the pin for alternate function, open-drain;
-///     - `Pin.ANALOG` - configure the pin for analog.
-///   - `pull` can be one of:
-///     - `Pin.PULL_NONE` - no pull up or down resistors;
-///     - `Pin.PULL_UP` - enable the pull-up resistor;
-///     - `Pin.PULL_DOWN` - enable the pull-down resistor.
-///   - when mode is Pin.AF_PP or Pin.AF_OD, then af can be the index or name
-///     of one of the alternate functions associated with a pin.
-///
-/// Returns: `None`.
-STATIC const mp_arg_t pin_init_args[] = {
-    { MP_QSTR_mode, MP_ARG_REQUIRED | MP_ARG_INT },
-    { MP_QSTR_pull,                   MP_ARG_INT, {.u_int = GPIO_NOPULL}},
-    { MP_QSTR_af,                     MP_ARG_INT, {.u_int = -1}},
-};
-#define PIN_INIT_NUM_ARGS MP_ARRAY_SIZE(pin_init_args)
+// init(mode, pull=None, af=-1, *, value, alt)
+STATIC mp_obj_t pin_obj_init_helper(const pin_obj_t *self, mp_uint_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_mode, MP_ARG_REQUIRED | MP_ARG_INT },
+        { MP_QSTR_pull, MP_ARG_OBJ, {.u_obj = mp_const_none}},
+        { MP_QSTR_af, MP_ARG_INT, {.u_int = -1}}, // legacy
+        { MP_QSTR_value, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL}},
+        { MP_QSTR_alt, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = -1}},
+    };
 
-STATIC mp_obj_t pin_obj_init_helper(const pin_obj_t *self, mp_uint_t n_args, const mp_obj_t *args, mp_map_t *kw_args) {
     // parse args
-    mp_arg_val_t vals[PIN_INIT_NUM_ARGS];
-    mp_arg_parse_all(n_args, args, kw_args, PIN_INIT_NUM_ARGS, pin_init_args, vals);
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     // get io mode
-    uint mode = vals[0].u_int;
+    uint mode = args[0].u_int;
     if (!IS_GPIO_MODE(mode)) {
         nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ValueError, "invalid pin mode: %d", mode));
     }
 
     // get pull mode
-    uint pull = vals[1].u_int;
+    uint pull = GPIO_NOPULL;
+    if (args[1].u_obj != mp_const_none) {
+        pull = mp_obj_get_int(args[1].u_obj);
+    }
     if (!IS_GPIO_PULL(pull)) {
         nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ValueError, "invalid pin pull: %d", pull));
     }
 
-    // get af (alternate function)
-    mp_int_t af = vals[2].u_int;
+    // get af (alternate function); alt-arg overrides af-arg
+    mp_int_t af = args[4].u_int;
+    if (af == -1) {
+        af = args[2].u_int;
+    }
     if ((mode == GPIO_MODE_AF_PP || mode == GPIO_MODE_AF_OD) && !IS_GPIO_AF(af)) {
         nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ValueError, "invalid pin af: %d", af));
     }
 
     // enable the peripheral clock for the port of this pin
-    switch (self->port) {
-        #ifdef __GPIOA_CLK_ENABLE
-        case PORT_A: __GPIOA_CLK_ENABLE(); break;
-        #endif
-        #ifdef __GPIOB_CLK_ENABLE
-        case PORT_B: __GPIOB_CLK_ENABLE(); break;
-        #endif
-        #ifdef __GPIOC_CLK_ENABLE
-        case PORT_C: __GPIOC_CLK_ENABLE(); break;
-        #endif
-        #ifdef __GPIOD_CLK_ENABLE
-        case PORT_D: __GPIOD_CLK_ENABLE(); break;
-        #endif
-        #ifdef __GPIOE_CLK_ENABLE
-        case PORT_E: __GPIOE_CLK_ENABLE(); break;
-        #endif
-        #ifdef __GPIOF_CLK_ENABLE
-        case PORT_F: __GPIOF_CLK_ENABLE(); break;
-        #endif
-        #ifdef __GPIOG_CLK_ENABLE
-        case PORT_G: __GPIOG_CLK_ENABLE(); break;
-        #endif
-        #ifdef __GPIOH_CLK_ENABLE
-        case PORT_H: __GPIOH_CLK_ENABLE(); break;
-        #endif
-        #ifdef __GPIOI_CLK_ENABLE
-        case PORT_I: __GPIOI_CLK_ENABLE(); break;
-        #endif
-        #ifdef __GPIOJ_CLK_ENABLE
-        case PORT_J: __GPIOJ_CLK_ENABLE(); break;
-        #endif
+    mp_hal_gpio_clock_enable(self->gpio);
+
+    // if given, set the pin value before initialising to prevent glitches
+    if (args[3].u_obj != MP_OBJ_NULL) {
+        mp_hal_pin_write(self, mp_obj_is_true(args[3].u_obj));
     }
 
     // configure the GPIO as requested
@@ -417,19 +395,7 @@ MP_DEFINE_CONST_FUN_OBJ_KW(pin_init_obj, 1, pin_obj_init);
 ///   anything that converts to a boolean.  If it converts to `True`, the pin
 ///   is set high, otherwise it is set low.
 STATIC mp_obj_t pin_value(mp_uint_t n_args, const mp_obj_t *args) {
-    pin_obj_t *self = args[0];
-    if (n_args == 1) {
-        // get pin
-        return MP_OBJ_NEW_SMALL_INT(GPIO_read_pin(self->gpio, self->pin));
-    } else {
-        // set pin
-        if (mp_obj_is_true(args[1])) {
-            GPIO_set_pin(self->gpio, self->pin_mask);
-        } else {
-            GPIO_clear_pin(self->gpio, self->pin_mask);
-        }
-        return mp_const_none;
-    }
+    return pin_call(args[0], n_args - 1, 0, args + 1);
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(pin_value_obj, 1, 2, pin_value);
 
@@ -437,7 +403,7 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(pin_value_obj, 1, 2, pin_value);
 /// Set the pin to a low logic level.
 STATIC mp_obj_t pin_low(mp_obj_t self_in) {
     pin_obj_t *self = self_in;
-    GPIO_clear_pin(self->gpio, self->pin_mask);;
+    mp_hal_pin_low(self);
     return mp_const_none;
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(pin_low_obj, pin_low);
@@ -446,7 +412,7 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_1(pin_low_obj, pin_low);
 /// Set the pin to a high logic level.
 STATIC mp_obj_t pin_high(mp_obj_t self_in) {
     pin_obj_t *self = self_in;
-    GPIO_set_pin(self->gpio, self->pin_mask);;
+    mp_hal_pin_high(self);
     return mp_const_none;
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(pin_high_obj, pin_high);
@@ -555,24 +521,21 @@ STATIC const mp_map_elem_t pin_locals_dict_table[] = {
     { MP_OBJ_NEW_QSTR(MP_QSTR_cpu),     (mp_obj_t)&pin_cpu_pins_obj_type },
 
     // class constants
-    /// \constant IN - initialise the pin to input mode
-    /// \constant OUT_PP - initialise the pin to output mode with a push-pull drive
-    /// \constant OUT_OD - initialise the pin to output mode with an open-drain drive
-    /// \constant AF_PP - initialise the pin to alternate-function mode with a push-pull drive
-    /// \constant AF_OD - initialise the pin to alternate-function mode with an open-drain drive
-    /// \constant ANALOG - initialise the pin to analog mode
-    /// \constant PULL_NONE - don't enable any pull up or down resistors on the pin
-    /// \constant PULL_UP - enable the pull-up resistor on the pin
-    /// \constant PULL_DOWN - enable the pull-down resistor on the pin
     { MP_OBJ_NEW_QSTR(MP_QSTR_IN),        MP_OBJ_NEW_SMALL_INT(GPIO_MODE_INPUT) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_OUT),       MP_OBJ_NEW_SMALL_INT(GPIO_MODE_OUTPUT_PP) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_OPEN_DRAIN), MP_OBJ_NEW_SMALL_INT(GPIO_MODE_OUTPUT_OD) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_ALT),       MP_OBJ_NEW_SMALL_INT(GPIO_MODE_AF_PP) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_ALT_OPEN_DRAIN), MP_OBJ_NEW_SMALL_INT(GPIO_MODE_AF_OD) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_ANALOG),    MP_OBJ_NEW_SMALL_INT(GPIO_MODE_ANALOG) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_PULL_UP),   MP_OBJ_NEW_SMALL_INT(GPIO_PULLUP) },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_PULL_DOWN), MP_OBJ_NEW_SMALL_INT(GPIO_PULLDOWN) },
+
+    // legacy class constants
     { MP_OBJ_NEW_QSTR(MP_QSTR_OUT_PP),    MP_OBJ_NEW_SMALL_INT(GPIO_MODE_OUTPUT_PP) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_OUT_OD),    MP_OBJ_NEW_SMALL_INT(GPIO_MODE_OUTPUT_OD) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_AF_PP),     MP_OBJ_NEW_SMALL_INT(GPIO_MODE_AF_PP) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_AF_OD),     MP_OBJ_NEW_SMALL_INT(GPIO_MODE_AF_OD) },
-    { MP_OBJ_NEW_QSTR(MP_QSTR_ANALOG),    MP_OBJ_NEW_SMALL_INT(GPIO_MODE_ANALOG) },
     { MP_OBJ_NEW_QSTR(MP_QSTR_PULL_NONE), MP_OBJ_NEW_SMALL_INT(GPIO_NOPULL) },
-    { MP_OBJ_NEW_QSTR(MP_QSTR_PULL_UP),   MP_OBJ_NEW_SMALL_INT(GPIO_PULLUP) },
-    { MP_OBJ_NEW_QSTR(MP_QSTR_PULL_DOWN), MP_OBJ_NEW_SMALL_INT(GPIO_PULLDOWN) },
 
 #include "genhdr/pins_af_const.h"
 };
@@ -584,6 +547,7 @@ const mp_obj_type_t pin_type = {
     .name = MP_QSTR_Pin,
     .print = pin_print,
     .make_new = pin_make_new,
+    .call = pin_call,
     .locals_dict = (mp_obj_t)&pin_locals_dict,
 };
 
@@ -616,9 +580,9 @@ const mp_obj_type_t pin_type = {
 
 /// \method __str__()
 /// Return a string describing the alternate function.
-STATIC void pin_af_obj_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+STATIC void pin_af_obj_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     pin_af_obj_t *self = self_in;
-    print(env, "Pin.%s", qstr_str(self->name));
+    mp_printf(print, "Pin.%q", self->name);
 }
 
 /// \method index()

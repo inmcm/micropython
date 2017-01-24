@@ -29,7 +29,6 @@
 
 #include "py/nlr.h"
 #include "py/runtime.h"
-#include MICROPY_HAL_H
 #include "bufhelper.h"
 #include "uart.h"
 
@@ -173,11 +172,11 @@ bool uart_init(pyb_uart_obj_t *uart_obj, uint32_t baudrate) {
     return uart_init2(uart_obj);
 }
 
-bool uart_rx_any(pyb_uart_obj_t *uart_obj) {
+mp_uint_t uart_rx_any(pyb_uart_obj_t *uart_obj) {
 #if 0
     return __HAL_UART_GET_FLAG(&uart_obj->uart, UART_FLAG_RXNE);
 #else
-    return false;
+    return 0;
 #endif
 }
 
@@ -224,20 +223,20 @@ void uart_tx_strn_cooked(pyb_uart_obj_t *uart_obj, const char *str, uint len) {
 /******************************************************************************/
 /* Micro Python bindings                                                      */
 
-STATIC void pyb_uart_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+STATIC void pyb_uart_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     pyb_uart_obj_t *self = self_in;
     if (!self->is_enabled) {
-        print(env, "UART(%lu)", self->uart_id);
+        mp_printf(print, "UART(%lu)", self->uart_id);
     } else {
 #if 0
-        print(env, "UART(%lu, baudrate=%u, bits=%u, stop=%u",
+        mp_printf(print, "UART(%lu, baudrate=%u, bits=%u, stop=%u",
             self->uart_id, self->uart.Init.BaudRate,
             self->uart.Init.WordLength == UART_WORDLENGTH_8B ? 8 : 9,
             self->uart.Init.StopBits == UART_STOPBITS_1 ? 1 : 2);
         if (self->uart.Init.Parity == UART_PARITY_NONE) {
-            print(env, ", parity=None)");
+            mp_print_str(print, ", parity=None)");
         } else {
-            print(env, ", parity=%u)", self->uart.Init.Parity == UART_PARITY_EVEN ? 0 : 1);
+            mp_printf(print, ", parity=%u)", self->uart.Init.Parity == UART_PARITY_EVEN ? 0 : 1);
         }
 #endif
     }
@@ -307,7 +306,7 @@ STATIC mp_obj_t pyb_uart_init_helper(pyb_uart_obj_t *self, uint n_args, const mp
 ///   - `UART(6)` is on `YA`: `(TX, RX) = (Y1, Y2) = (PC6, PC7)`
 ///   - `UART(3)` is on `YB`: `(TX, RX) = (Y9, Y10) = (PB10, PB11)`
 ///   - `UART(2)` is on: `(TX, RX) = (X3, X4) = (PA2, PA3)`
-STATIC mp_obj_t pyb_uart_make_new(mp_obj_t type_in, uint n_args, uint n_kw, const mp_obj_t *args) {
+STATIC mp_obj_t pyb_uart_make_new(const mp_obj_type_t *type, uint n_args, uint n_kw, const mp_obj_t *args) {
     // check arguments
     mp_arg_check_num(n_args, n_kw, 1, MP_OBJ_FUN_ARGS_MAX, true);
 

@@ -37,10 +37,7 @@
 #if MICROPY_PY_BUILTINS_COMPLEX
 
 #include <math.h>
-
-#if MICROPY_FLOAT_IMPL == MICROPY_FLOAT_IMPL_FLOAT
 #include "py/formatfloat.h"
-#endif
 
 typedef struct _mp_obj_complex_t {
     mp_obj_base_t base;
@@ -48,41 +45,31 @@ typedef struct _mp_obj_complex_t {
     mp_float_t imag;
 } mp_obj_complex_t;
 
-STATIC void complex_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t o_in, mp_print_kind_t kind) {
+STATIC void complex_print(const mp_print_t *print, mp_obj_t o_in, mp_print_kind_t kind) {
     (void)kind;
-    mp_obj_complex_t *o = o_in;
+    mp_obj_complex_t *o = MP_OBJ_TO_PTR(o_in);
 #if MICROPY_FLOAT_IMPL == MICROPY_FLOAT_IMPL_FLOAT
     char buf[16];
-    if (o->real == 0) {
-        mp_format_float(o->imag, buf, sizeof(buf), 'g', 7, '\0');
-        print(env, "%sj", buf);
-    } else {
-        mp_format_float(o->real, buf, sizeof(buf), 'g', 7, '\0');
-        print(env, "(%s", buf);
-        if (o->imag >= 0) {
-            print(env, "+");
-        }
-        mp_format_float(o->imag, buf, sizeof(buf), 'g', 7, '\0');
-        print(env, "%sj)", buf);
-    }
+    const int precision = 7;
 #else
     char buf[32];
-    if (o->real == 0) {
-        sprintf(buf, "%.16g", (double)o->imag);
-        print(env, "%sj", buf);
-    } else {
-        sprintf(buf, "%.16g", (double)o->real);
-        print(env, "(%s", buf);
-        if (o->imag >= 0) {
-            print(env, "+");
-        }
-        sprintf(buf, "%.16g", (double)o->imag);
-        print(env, "%sj)", buf);
-    }
+    const int precision = 16;
 #endif
+    if (o->real == 0) {
+        mp_format_float(o->imag, buf, sizeof(buf), 'g', precision, '\0');
+        mp_printf(print, "%sj", buf);
+    } else {
+        mp_format_float(o->real, buf, sizeof(buf), 'g', precision, '\0');
+        mp_printf(print, "(%s", buf);
+        if (o->imag >= 0 || isnan(o->imag)) {
+            mp_print_str(print, "+");
+        }
+        mp_format_float(o->imag, buf, sizeof(buf), 'g', precision, '\0');
+        mp_printf(print, "%sj)", buf);
+    }
 }
 
-STATIC mp_obj_t complex_make_new(mp_obj_t type_in, mp_uint_t n_args, mp_uint_t n_kw, const mp_obj_t *args) {
+STATIC mp_obj_t complex_make_new(const mp_obj_type_t *type_in, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     (void)type_in;
     mp_arg_check_num(n_args, n_kw, 0, 2, false);
 
@@ -127,9 +114,9 @@ STATIC mp_obj_t complex_make_new(mp_obj_t type_in, mp_uint_t n_args, mp_uint_t n
 }
 
 STATIC mp_obj_t complex_unary_op(mp_uint_t op, mp_obj_t o_in) {
-    mp_obj_complex_t *o = o_in;
+    mp_obj_complex_t *o = MP_OBJ_TO_PTR(o_in);
     switch (op) {
-        case MP_UNARY_OP_BOOL: return MP_BOOL(o->real != 0 || o->imag != 0);
+        case MP_UNARY_OP_BOOL: return mp_obj_new_bool(o->real != 0 || o->imag != 0);
         case MP_UNARY_OP_POSITIVE: return o_in;
         case MP_UNARY_OP_NEGATIVE: return mp_obj_new_complex(-o->real, -o->imag);
         default: return MP_OBJ_NULL; // op not supported
@@ -137,12 +124,16 @@ STATIC mp_obj_t complex_unary_op(mp_uint_t op, mp_obj_t o_in) {
 }
 
 STATIC mp_obj_t complex_binary_op(mp_uint_t op, mp_obj_t lhs_in, mp_obj_t rhs_in) {
-    mp_obj_complex_t *lhs = lhs_in;
+    mp_obj_complex_t *lhs = MP_OBJ_TO_PTR(lhs_in);
     return mp_obj_complex_binary_op(op, lhs->real, lhs->imag, rhs_in);
 }
 
-STATIC void complex_load_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest) {
-    mp_obj_complex_t *self = self_in;
+STATIC void complex_attr(mp_obj_t self_in, qstr attr, mp_obj_t *dest) {
+    if (dest[0] != MP_OBJ_NULL) {
+        // not load attribute
+        return;
+    }
+    mp_obj_complex_t *self = MP_OBJ_TO_PTR(self_in);
     if (attr == MP_QSTR_real) {
         dest[0] = mp_obj_new_float(self->real);
     } else if (attr == MP_QSTR_imag) {
@@ -157,7 +148,7 @@ const mp_obj_type_t mp_type_complex = {
     .make_new = complex_make_new,
     .unary_op = complex_unary_op,
     .binary_op = complex_binary_op,
-    .load_attr = complex_load_attr,
+    .attr = complex_attr,
 };
 
 mp_obj_t mp_obj_new_complex(mp_float_t real, mp_float_t imag) {
@@ -165,12 +156,12 @@ mp_obj_t mp_obj_new_complex(mp_float_t real, mp_float_t imag) {
     o->base.type = &mp_type_complex;
     o->real = real;
     o->imag = imag;
-    return o;
+    return MP_OBJ_FROM_PTR(o);
 }
 
 void mp_obj_complex_get(mp_obj_t self_in, mp_float_t *real, mp_float_t *imag) {
     assert(MP_OBJ_IS_TYPE(self_in, &mp_type_complex));
-    mp_obj_complex_t *self = self_in;
+    mp_obj_complex_t *self = MP_OBJ_TO_PTR(self_in);
     *real = self->real;
     *imag = self->imag;
 }
@@ -206,7 +197,7 @@ mp_obj_t mp_obj_complex_binary_op(mp_uint_t op, mp_float_t lhs_real, mp_float_t 
         case MP_BINARY_OP_INPLACE_TRUE_DIVIDE:
             if (rhs_imag == 0) {
                 if (rhs_real == 0) {
-                    nlr_raise(mp_obj_new_exception_msg(&mp_type_ZeroDivisionError, "complex division by zero"));
+                    mp_raise_msg(&mp_type_ZeroDivisionError, "complex division by zero");
                 }
                 lhs_real /= rhs_real;
                 lhs_imag /= rhs_real;
@@ -235,7 +226,7 @@ mp_obj_t mp_obj_complex_binary_op(mp_uint_t op, mp_float_t lhs_real, mp_float_t 
                     lhs_real = 1;
                     rhs_real = 0;
                 } else {
-                    nlr_raise(mp_obj_new_exception_msg(&mp_type_ZeroDivisionError, "0.0 to a complex power"));
+                    mp_raise_msg(&mp_type_ZeroDivisionError, "0.0 to a complex power");
                 }
             } else {
                 mp_float_t ln1 = MICROPY_FLOAT_C_FUN(log)(abs1);
@@ -249,7 +240,7 @@ mp_obj_t mp_obj_complex_binary_op(mp_uint_t op, mp_float_t lhs_real, mp_float_t 
             break;
         }
 
-        case MP_BINARY_OP_EQUAL: return MP_BOOL(lhs_real == rhs_real && lhs_imag == rhs_imag);
+        case MP_BINARY_OP_EQUAL: return mp_obj_new_bool(lhs_real == rhs_real && lhs_imag == rhs_imag);
 
         default:
             return MP_OBJ_NULL; // op not supported

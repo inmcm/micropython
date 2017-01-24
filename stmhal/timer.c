@@ -28,17 +28,17 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <stm32f4xx_hal.h>
+#include STM32_HAL_H
 #include "usbd_cdc_msc_hid.h"
 #include "usbd_cdc_interface.h"
 
 #include "py/nlr.h"
 #include "py/runtime.h"
 #include "py/gc.h"
-#include "py/pfenv.h"
 #include "timer.h"
 #include "servo.h"
 #include "pin.h"
+#include "irq.h"
 
 /// \moduleref pyb
 /// \class Timer - periodically call a function
@@ -68,7 +68,7 @@
 ///     tim.callback(lambda t: ...)     # set callback for update interrupt (t=tim instance)
 ///     tim.callback(None)              # clear callback
 ///
-/// *Note:* Timer 3 is reserved for internal use.  Timer 5 controls
+/// *Note:* Timer 3 is used for fading the blue LED.  Timer 5 controls
 /// the servo driver, and Timer 6 is used for timed ADC/DAC reading/writing.
 /// It is recommended to use the other timers in your programs.
 
@@ -76,8 +76,6 @@
 // the interrupts to be dispatched, so they are all collected here.
 //
 // TIM3:
-//  - flash storage controller, to flush the cache
-//  - USB CDC interface, interval, to check for new data
 //  - LED 4, PWM to set the LED intensity
 //
 // TIM5:
@@ -144,22 +142,16 @@ typedef struct _pyb_timer_obj_t {
 #define TIMER_CNT_MASK(self)    ((self)->is_32bit ? 0xffffffff : 0xffff)
 #define TIMER_CHANNEL(self)     ((((self)->channel) - 1) << 2)
 
-TIM_HandleTypeDef TIM3_Handle;
 TIM_HandleTypeDef TIM5_Handle;
 TIM_HandleTypeDef TIM6_Handle;
 
-// Used to divide down TIM3 and periodically call the flash storage IRQ
-STATIC uint32_t tim3_counter = 0;
-
 #define PYB_TIMER_OBJ_ALL_NUM MP_ARRAY_SIZE(MP_STATE_PORT(pyb_timer_obj_all))
 
-STATIC uint32_t timer_get_source_freq(uint32_t tim_id);
 STATIC mp_obj_t pyb_timer_deinit(mp_obj_t self_in);
 STATIC mp_obj_t pyb_timer_callback(mp_obj_t self_in, mp_obj_t callback);
 STATIC mp_obj_t pyb_timer_channel_callback(mp_obj_t self_in, mp_obj_t callback);
 
 void timer_init0(void) {
-    tim3_counter = 0;
     for (uint i = 0; i < PYB_TIMER_OBJ_ALL_NUM; i++) {
         MP_STATE_PORT(pyb_timer_obj_all)[i] = NULL;
     }
@@ -175,34 +167,6 @@ void timer_deinit(void) {
     }
 }
 
-// TIM3 is set-up for the USB CDC interface
-void timer_tim3_init(void) {
-    // set up the timer for USBD CDC
-    __TIM3_CLK_ENABLE();
-
-    TIM3_Handle.Instance = TIM3;
-    TIM3_Handle.Init.Period = (USBD_CDC_POLLING_INTERVAL*1000) - 1; // TIM3 fires every USBD_CDC_POLLING_INTERVAL ms
-    TIM3_Handle.Init.Prescaler = timer_get_source_freq(3) / 1000000 - 1; // TIM3 runs at 1MHz
-    TIM3_Handle.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    TIM3_Handle.Init.CounterMode = TIM_COUNTERMODE_UP;
-    HAL_TIM_Base_Init(&TIM3_Handle);
-
-    HAL_NVIC_SetPriority(TIM3_IRQn, 6, 0);
-    HAL_NVIC_EnableIRQ(TIM3_IRQn);
-
-    if (HAL_TIM_Base_Start(&TIM3_Handle) != HAL_OK) {
-        /* Starting Error */
-    }
-}
-
-/* unused
-void timer_tim3_deinit(void) {
-    // reset TIM3 timer
-    __TIM3_FORCE_RESET();
-    __TIM3_RELEASE_RESET();
-}
-*/
-
 // TIM5 is set-up for the servo controller
 // This function inits but does not start the timer
 void timer_tim5_init(void) {
@@ -210,7 +174,7 @@ void timer_tim5_init(void) {
     __TIM5_CLK_ENABLE();
 
     // set up and enable interrupt
-    HAL_NVIC_SetPriority(TIM5_IRQn, 6, 0);
+    HAL_NVIC_SetPriority(TIM5_IRQn, IRQ_PRI_TIM5, IRQ_SUBPRI_TIM5);
     HAL_NVIC_EnableIRQ(TIM5_IRQn);
 
     // PWM clock configuration
@@ -223,10 +187,11 @@ void timer_tim5_init(void) {
     HAL_TIM_PWM_Init(&TIM5_Handle);
 }
 
+#if defined(TIM6)
 // Init TIM6 with a counter-overflow at the given frequency (given in Hz)
 // TIM6 is used by the DAC and ADC for auto sampling at a given frequency
 // This function inits but does not start the timer
-void timer_tim6_init(uint freq) {
+TIM_HandleTypeDef *timer_tim6_init(uint freq) {
     // TIM6 clock enable
     __TIM6_CLK_ENABLE();
 
@@ -246,20 +211,14 @@ void timer_tim6_init(uint freq) {
     TIM6_Handle.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1; // unused for TIM6
     TIM6_Handle.Init.CounterMode = TIM_COUNTERMODE_UP; // unused for TIM6
     HAL_TIM_Base_Init(&TIM6_Handle);
+
+    return &TIM6_Handle;
 }
+#endif
 
 // Interrupt dispatch
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim == &TIM3_Handle) {
-        USBD_CDC_HAL_TIM_PeriodElapsedCallback();
-
-        // Periodically raise a flash IRQ for the flash storage controller
-        if (tim3_counter++ >= 500 / USBD_CDC_POLLING_INTERVAL) {
-            tim3_counter = 0;
-            NVIC->STIR = FLASH_IRQn;
-        }
-
-    } else if (htim == &TIM5_Handle) {
+    if (htim == &TIM5_Handle) {
         servo_timer_irq_callback();
     }
 }
@@ -269,7 +228,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 // If the APB prescaler is 1, then the timer clock is equal to its respective
 // APB clock.  Otherwise (APB prescaler > 1) the timer clock is twice its
 // respective APB clock.  See DM00031020 Rev 4, page 115.
-STATIC uint32_t timer_get_source_freq(uint32_t tim_id) {
+uint32_t timer_get_source_freq(uint32_t tim_id) {
     uint32_t source;
     if (tim_id == 1 || (8 <= tim_id && tim_id <= 11)) {
         // TIM{1,8,9,10,11} are on APB2
@@ -365,13 +324,13 @@ STATIC uint32_t compute_pwm_value_from_percent(uint32_t period, mp_obj_t percent
     if (0) {
     #if MICROPY_PY_BUILTINS_FLOAT
     } else if (MP_OBJ_IS_TYPE(percent_in, &mp_type_float)) {
-        float percent = mp_obj_get_float(percent_in);
+        mp_float_t percent = mp_obj_get_float(percent_in);
         if (percent <= 0.0) {
             cmp = 0;
         } else if (percent >= 100.0) {
             cmp = period;
         } else {
-            cmp = percent / 100.0 * ((float)period);
+            cmp = percent / 100.0 * ((mp_float_t)period);
         }
     #endif
     } else {
@@ -395,11 +354,11 @@ STATIC uint32_t compute_pwm_value_from_percent(uint32_t period, mp_obj_t percent
 // Helper function to compute percentage from timer perion and PWM value.
 STATIC mp_obj_t compute_percent_from_pwm_value(uint32_t period, uint32_t cmp) {
     #if MICROPY_PY_BUILTINS_FLOAT
-    float percent;
+    mp_float_t percent;
     if (cmp >= period) {
         percent = 100.0;
     } else {
-        percent = (float)cmp * 100.0 / ((float)period);
+        percent = (mp_float_t)cmp * 100.0 / ((mp_float_t)period);
     }
     return mp_obj_new_float(percent);
     #else
@@ -468,17 +427,25 @@ STATIC void config_deadtime(pyb_timer_obj_t *self, mp_int_t ticks) {
     HAL_TIMEx_ConfigBreakDeadTime(&self->tim, &deadTimeConfig);
 }
 
-STATIC void pyb_timer_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+TIM_HandleTypeDef *pyb_timer_get_handle(mp_obj_t timer) {
+    if (mp_obj_get_type(timer) != &pyb_timer_type) {
+        nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "need a Timer object"));
+    }
+    pyb_timer_obj_t *self = timer;
+    return &self->tim;
+}
+
+STATIC void pyb_timer_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     pyb_timer_obj_t *self = self_in;
 
     if (self->tim.State == HAL_TIM_STATE_RESET) {
-        print(env, "Timer(%u)", self->tim_id);
+        mp_printf(print, "Timer(%u)", self->tim_id);
     } else {
         uint32_t prescaler = self->tim.Instance->PSC & 0xffff;
         uint32_t period = __HAL_TIM_GetAutoreload(&self->tim) & TIMER_CNT_MASK(self);
         // for efficiency, we compute and print freq as an int (not a float)
         uint32_t freq = timer_get_source_freq(self->tim_id) / ((prescaler + 1) * (period + 1));
-        print(env, "Timer(%u, freq=%u, prescaler=%u, period=%u, mode=%s, div=%u",
+        mp_printf(print, "Timer(%u, freq=%u, prescaler=%u, period=%u, mode=%s, div=%u",
             self->tim_id,
             freq,
             prescaler,
@@ -487,10 +454,19 @@ STATIC void pyb_timer_print(void (*print)(void *env, const char *fmt, ...), void
             self->tim.Init.CounterMode == TIM_COUNTERMODE_DOWN   ? "DOWN" : "CENTER",
             self->tim.Init.ClockDivision == TIM_CLOCKDIVISION_DIV4 ? 4 :
             self->tim.Init.ClockDivision == TIM_CLOCKDIVISION_DIV2 ? 2 : 1);
-        if (IS_TIM_ADVANCED_INSTANCE(self->tim.Instance)) {
-            print(env, ", deadtime=%u", compute_ticks_from_dtg(self->tim.Instance->BDTR & TIM_BDTR_DTG));
+
+        #if defined(IS_TIM_ADVANCED_INSTANCE)
+        if (IS_TIM_ADVANCED_INSTANCE(self->tim.Instance))
+        #elif defined(IS_TIM_BREAK_INSTANCE)
+        if (IS_TIM_BREAK_INSTANCE(self->tim.Instance))
+        #else
+        if (0)
+        #endif
+        {
+            mp_printf(print, ", deadtime=%u",
+                compute_ticks_from_dtg(self->tim.Instance->BDTR & TIM_BDTR_DTG));
         }
-        print(env, ")");
+        mp_print_str(print, ")");
     }
 }
 
@@ -586,25 +562,65 @@ STATIC mp_obj_t pyb_timer_init_helper(pyb_timer_obj_t *self, mp_uint_t n_args, c
         case 3: __TIM3_CLK_ENABLE(); break;
         case 4: __TIM4_CLK_ENABLE(); break;
         case 5: __TIM5_CLK_ENABLE(); break;
+        #if defined(TIM6)
         case 6: __TIM6_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM7)
         case 7: __TIM7_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM8)
         case 8: __TIM8_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM9)
         case 9: __TIM9_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM10)
         case 10: __TIM10_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM11)
         case 11: __TIM11_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM12)
         case 12: __TIM12_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM13)
         case 13: __TIM13_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM14)
         case 14: __TIM14_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM15)
+        case 15: __TIM15_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM16)
+        case 16: __TIM16_CLK_ENABLE(); break;
+        #endif
+        #if defined(TIM17)
+        case 17: __TIM17_CLK_ENABLE(); break;
+        #endif
     }
 
     // set IRQ priority (if not a special timer)
-    if (self->tim_id != 3 && self->tim_id != 5) {
-        HAL_NVIC_SetPriority(self->irqn, 0xe, 0xe); // next-to lowest priority
+    if (self->tim_id != 5) {
+        HAL_NVIC_SetPriority(self->irqn, IRQ_PRI_TIMX, IRQ_SUBPRI_TIMX);
+        if (self->tim_id == 1) {
+            HAL_NVIC_SetPriority(TIM1_CC_IRQn, IRQ_PRI_TIMX, IRQ_SUBPRI_TIMX);
+        #if defined(TIM8)
+        } else if (self->tim_id == 8) {
+            HAL_NVIC_SetPriority(TIM8_CC_IRQn, IRQ_PRI_TIMX, IRQ_SUBPRI_TIMX);
+        #endif
+        }
     }
 
     // init TIM
     HAL_TIM_Base_Init(&self->tim);
+    #if defined(IS_TIM_ADVANCED_INSTANCE)
     if (IS_TIM_ADVANCED_INSTANCE(self->tim.Instance)) {
+    #elif defined(IS_TIM_BREAK_INSTANCE)
+    if (IS_TIM_BREAK_INSTANCE(self->tim.Instance)) {
+    #else
+    if (0) {
+    #endif
         config_deadtime(self, args[6].u_int);
     }
     if (args[5].u_obj == mp_const_none) {
@@ -620,7 +636,7 @@ STATIC mp_obj_t pyb_timer_init_helper(pyb_timer_obj_t *self, mp_uint_t n_args, c
 /// Construct a new timer object of the given id.  If additional
 /// arguments are given, then the timer is initialised by `init(...)`.
 /// `id` can be 1 to 14, excluding 3.
-STATIC mp_obj_t pyb_timer_make_new(mp_obj_t type_in, mp_uint_t n_args, mp_uint_t n_kw, const mp_obj_t *args) {
+STATIC mp_obj_t pyb_timer_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     // check arguments
     mp_arg_check_num(n_args, n_kw, 1, MP_OBJ_FUN_ARGS_MAX, true);
 
@@ -637,20 +653,55 @@ STATIC mp_obj_t pyb_timer_make_new(mp_obj_t type_in, mp_uint_t n_args, mp_uint_t
     tim->is_32bit = false;
 
     switch (tim->tim_id) {
+        #if defined(MCU_SERIES_F4) || defined(MCU_SERIES_F7)
         case 1: tim->tim.Instance = TIM1; tim->irqn = TIM1_UP_TIM10_IRQn; break;
+        #elif defined(MCU_SERIES_L4)
+        case 1: tim->tim.Instance = TIM1; tim->irqn = TIM1_UP_TIM16_IRQn; break;
+        #endif
         case 2: tim->tim.Instance = TIM2; tim->irqn = TIM2_IRQn; tim->is_32bit = true; break;
-        case 3: nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "Timer 3 is for internal use only")); // TIM3 used for low-level stuff; go via regs if necessary
+        case 3: tim->tim.Instance = TIM3; tim->irqn = TIM3_IRQn; break;
         case 4: tim->tim.Instance = TIM4; tim->irqn = TIM4_IRQn; break;
         case 5: tim->tim.Instance = TIM5; tim->irqn = TIM5_IRQn; tim->is_32bit = true; break;
+        #if defined(TIM6)
         case 6: tim->tim.Instance = TIM6; tim->irqn = TIM6_DAC_IRQn; break;
+        #endif
+        #if defined(TIM7)
         case 7: tim->tim.Instance = TIM7; tim->irqn = TIM7_IRQn; break;
+        #endif
+        #if defined(TIM8)
+        #if defined(MCU_SERIES_F4) || defined(MCU_SERIES_F7)
         case 8: tim->tim.Instance = TIM8; tim->irqn = TIM8_UP_TIM13_IRQn; break;
+        #elif defined(MCU_SERIES_L4)
+        case 8: tim->tim.Instance = TIM8; tim->irqn = TIM8_UP_IRQn; break;
+        #endif
+        #endif
+        #if defined(TIM9)
         case 9: tim->tim.Instance = TIM9; tim->irqn = TIM1_BRK_TIM9_IRQn; break;
+        #endif
+        #if defined(TIM10)
         case 10: tim->tim.Instance = TIM10; tim->irqn = TIM1_UP_TIM10_IRQn; break;
+        #endif
+        #if defined(TIM11)
         case 11: tim->tim.Instance = TIM11; tim->irqn = TIM1_TRG_COM_TIM11_IRQn; break;
+        #endif
+        #if defined(TIM12)
         case 12: tim->tim.Instance = TIM12; tim->irqn = TIM8_BRK_TIM12_IRQn; break;
+        #endif
+        #if defined(TIM13)
         case 13: tim->tim.Instance = TIM13; tim->irqn = TIM8_UP_TIM13_IRQn; break;
+        #endif
+        #if defined(TIM14)
         case 14: tim->tim.Instance = TIM14; tim->irqn = TIM8_TRG_COM_TIM14_IRQn; break;
+        #endif
+        #if defined(TIM15)
+        case 15: tim->tim.Instance = TIM15; tim->irqn = TIM1_BRK_TIM15_IRQn; break;
+        #endif
+        #if defined(TIM16)
+        case 16: tim->tim.Instance = TIM16; tim->irqn = TIM1_UP_TIM16_IRQn; break;
+        #endif
+        #if defined(TIM17)
+        case 17: tim->tim.Instance = TIM17; tim->irqn = TIM1_TRG_COM_TIM17_IRQn; break;
+        #endif
         default: nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ValueError, "Timer %d does not exist", tim->tim_id));
     }
 
@@ -845,7 +896,7 @@ STATIC mp_obj_t pyb_timer_channel(mp_uint_t n_args, const mp_obj_t *pos_args, mp
         const pin_obj_t *pin = pin_obj;
         const pin_af_obj_t *af = pin_find_af(pin, AF_FN_TIM, self->tim_id);
         if (af == NULL) {
-            nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ValueError, "pin %s doesn't have an af for TIM%d", qstr_str(pin->name), self->tim_id));
+            nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ValueError, "pin %q doesn't have an af for TIM%d", pin->name, self->tim_id));
         }
         // pin.init(mode=AF_PP, af=idx)
         const mp_obj_t args2[6] = {
@@ -888,7 +939,7 @@ STATIC mp_obj_t pyb_timer_channel(mp_uint_t n_args, const mp_obj_t *pos_args, mp
             if (chan->callback == mp_const_none) {
                 HAL_TIM_PWM_Start(&self->tim, TIMER_CHANNEL(chan));
             } else {
-                HAL_TIM_PWM_Start_IT(&self->tim, TIMER_CHANNEL(chan));
+                pyb_timer_channel_callback(chan, chan->callback);
             }
             // Start the complimentary channel too (if its supported)
             if (IS_TIM_CCXN_INSTANCE(self->tim.Instance, TIMER_CHANNEL(chan))) {
@@ -926,7 +977,7 @@ STATIC mp_obj_t pyb_timer_channel(mp_uint_t n_args, const mp_obj_t *pos_args, mp
             if (chan->callback == mp_const_none) {
                 HAL_TIM_OC_Start(&self->tim, TIMER_CHANNEL(chan));
             } else {
-                HAL_TIM_OC_Start_IT(&self->tim, TIMER_CHANNEL(chan));
+                pyb_timer_channel_callback(chan, chan->callback);
             }
             // Start the complimentary channel too (if its supported)
             if (IS_TIM_CCXN_INSTANCE(self->tim.Instance, TIMER_CHANNEL(chan))) {
@@ -953,7 +1004,7 @@ STATIC mp_obj_t pyb_timer_channel(mp_uint_t n_args, const mp_obj_t *pos_args, mp
             if (chan->callback == mp_const_none) {
                 HAL_TIM_IC_Start(&self->tim, TIMER_CHANNEL(chan));
             } else {
-                HAL_TIM_IC_Start_IT(&self->tim, TIMER_CHANNEL(chan));
+                pyb_timer_channel_callback(chan, chan->callback);
             }
             break;
         }
@@ -985,11 +1036,23 @@ STATIC mp_obj_t pyb_timer_channel(mp_uint_t n_args, const mp_obj_t *pos_args, mp
             &&  self->tim.Instance != TIM3
             &&  self->tim.Instance != TIM4
             &&  self->tim.Instance != TIM5
-            &&  self->tim.Instance != TIM8 ) {
+            #if defined(TIM8)
+            &&  self->tim.Instance != TIM8
+            #endif
+            ) {
                 nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ValueError, "encoder not supported on timer %d", self->tim_id));
             }
+
+            // Disable & clear the timer interrupt so that we don't trigger
+            // an interrupt by initializing the timer.
+            __HAL_TIM_DISABLE_IT(&self->tim, TIM_IT_UPDATE);
             HAL_TIM_Encoder_Init(&self->tim, &enc_config);
             __HAL_TIM_SetCounter(&self->tim, 0);
+            if (self->callback != mp_const_none) {
+                __HAL_TIM_CLEAR_FLAG(&self->tim, TIM_IT_UPDATE);
+                __HAL_TIM_ENABLE_IT(&self->tim, TIM_IT_UPDATE);
+            }
+            HAL_TIM_Encoder_Start(&self->tim, TIM_CHANNEL_ALL);
             break;
         }
 
@@ -1049,6 +1112,10 @@ STATIC mp_obj_t pyb_timer_freq(mp_uint_t n_args, const mp_obj_t *args) {
         uint32_t prescaler = compute_prescaler_period_from_freq(self, args[1], &period);
         self->tim.Instance->PSC = prescaler;
         __HAL_TIM_SetAutoreload(&self->tim, period);
+        // Reset the counter to zero. Otherwise, if counter >= period it will
+        // continue counting until it wraps (at either 16 or 32 bits depending
+        // on the timer).
+        __HAL_TIM_SetCounter(&self->tim, 0);
         return mp_const_none;
     }
 }
@@ -1079,6 +1146,10 @@ STATIC mp_obj_t pyb_timer_period(mp_uint_t n_args, const mp_obj_t *args) {
     } else {
         // set
         __HAL_TIM_SetAutoreload(&self->tim, mp_obj_get_int(args[1]) & TIMER_CNT_MASK(self));
+        // Reset the counter to zero. Otherwise, if counter >= period it will
+        // continue counting until it wraps (at either 16 or 32 bits depending
+        // on the timer).
+        __HAL_TIM_SetCounter(&self->tim, 0); 
         return mp_const_none;
     }
 }
@@ -1095,9 +1166,12 @@ STATIC mp_obj_t pyb_timer_callback(mp_obj_t self_in, mp_obj_t callback) {
         __HAL_TIM_DISABLE_IT(&self->tim, TIM_IT_UPDATE);
         self->callback = mp_const_none;
     } else if (mp_obj_is_callable(callback)) {
+        __HAL_TIM_DISABLE_IT(&self->tim, TIM_IT_UPDATE);
         self->callback = callback;
-        // start timer, so that it interrupts on overflow
-        HAL_TIM_Base_Start_IT(&self->tim);
+        // start timer, so that it interrupts on overflow, but clear any
+        // pending interrupts which may have been set by initializing it.
+        __HAL_TIM_CLEAR_FLAG(&self->tim, TIM_IT_UPDATE);
+        HAL_TIM_Base_Start_IT(&self->tim); // This will re-enable the IRQ
         HAL_NVIC_EnableIRQ(self->irqn);
     } else {
         nlr_raise(mp_obj_new_exception_msg(&mp_type_ValueError, "callback must be None or a callable object"));
@@ -1154,10 +1228,10 @@ const mp_obj_type_t pyb_timer_type = {
 /// Timer channels are used to generate/capture a signal using a timer.
 ///
 /// TimerChannel objects are created using the Timer.channel() method.
-STATIC void pyb_timer_channel_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+STATIC void pyb_timer_channel_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     pyb_timer_channel_obj_t *self = self_in;
 
-    print(env, "TimerChannel(timer=%u, channel=%u, mode=%s)",
+    mp_printf(print, "TimerChannel(timer=%u, channel=%u, mode=%s)",
           self->timer->tim_id,
           self->channel,
           qstr_str(channel_mode_info[self->mode].name));
@@ -1227,7 +1301,16 @@ STATIC mp_obj_t pyb_timer_channel_callback(mp_obj_t self_in, mp_obj_t callback) 
         self->callback = mp_const_none;
     } else if (mp_obj_is_callable(callback)) {
         self->callback = callback;
-        HAL_NVIC_EnableIRQ(self->timer->irqn);
+        uint8_t tim_id = self->timer->tim_id;
+        if (tim_id == 1) {
+            HAL_NVIC_EnableIRQ(TIM1_CC_IRQn);
+        #if defined(TIM8) // STM32F401 doesn't have a TIM8
+        } else if (tim_id == 8) {
+            HAL_NVIC_EnableIRQ(TIM8_CC_IRQn);
+        #endif
+        } else {
+            HAL_NVIC_EnableIRQ(self->timer->irqn);
+        }
         // start timer, so that it interrupts on overflow
         switch (self->mode) {
             case CHANNEL_MODE_PWM_NORMAL:
@@ -1296,7 +1379,7 @@ STATIC void timer_handle_irq_channel(pyb_timer_obj_t *tim, uint8_t channel, mp_o
                     } else {
                         printf("uncaught exception in Timer(%u) channel %u interrupt handler\n", tim->tim_id, channel);
                     }
-                    mp_obj_print_exception(printf_wrapper, NULL, (mp_obj_t)nlr.ret_val);
+                    mp_obj_print_exception(&mp_plat_print, (mp_obj_t)nlr.ret_val);
                 }
                 gc_unlock();
             }
@@ -1330,8 +1413,9 @@ void timer_irq_handler(uint tim_id) {
 
         // Finally, clear any remaining interrupt sources. Otherwise we'll
         // just get called continuously.
-        uint32_t unhandled = __HAL_TIM_GET_ITSTATUS(&tim->tim, 0xff & ~handled);
+        uint32_t unhandled = tim->tim.Instance->DIER & 0xff & ~handled;
         if (unhandled != 0) {
+            __HAL_TIM_DISABLE_IT(&tim->tim, unhandled);
             __HAL_TIM_CLEAR_IT(&tim->tim, unhandled);
             printf("Unhandled interrupt SR=0x%02lx (now disabled)\n", unhandled);
         }

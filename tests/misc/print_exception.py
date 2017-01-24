@@ -1,10 +1,13 @@
-import _io as io # uPy does not have io module builtin
+try:
+    import uio as io
+except ImportError:
+    import io
 import sys
 if hasattr(sys, 'print_exception'):
     print_exception = sys.print_exception
 else:
     import traceback
-    print_exception = lambda e, f: traceback.print_exception(None, e, None, file=f)
+    print_exception = lambda e, f: traceback.print_exception(None, e, sys.exc_info()[2], file=f)
 
 def print_exc(e):
     buf = io.StringIO()
@@ -23,7 +26,7 @@ def print_exc(e):
 
 # basic exception message
 try:
-    XXX
+    1/0
 except Exception as e:
     print('caught')
     print_exc(e)
@@ -32,7 +35,7 @@ except Exception as e:
 def f():
     g()
 def g():
-    YYY
+    2/0
 try:
     f()
 except Exception as e:

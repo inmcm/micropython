@@ -26,7 +26,7 @@
 
 #include <stdio.h>
 
-#include "stm32f4xx_hal.h"
+#include STM32_HAL_H
 
 #include "py/nlr.h"
 #include "py/runtime.h"
@@ -178,14 +178,14 @@ STATIC mp_obj_t pyb_pwm_set(mp_obj_t period, mp_obj_t pulse) {
 
 MP_DEFINE_CONST_FUN_OBJ_2(pyb_pwm_set_obj, pyb_pwm_set);
 
-STATIC void pyb_servo_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+STATIC void pyb_servo_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     pyb_servo_obj_t *self = self_in;
-    print(env, "<Servo %lu at %luus>", self->servo_id, 10 * self->pulse_cur);
+    mp_printf(print, "<Servo %lu at %luus>", self->servo_id, 10 * self->pulse_cur);
 }
 
 /// \classmethod \constructor(id)
 /// Create a servo object.  `id` is 1-4.
-STATIC mp_obj_t pyb_servo_make_new(mp_obj_t type_in, mp_uint_t n_args, mp_uint_t n_kw, const mp_obj_t *args) {
+STATIC mp_obj_t pyb_servo_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     // check arguments
     mp_arg_check_num(n_args, n_kw, 1, 1, false);
 

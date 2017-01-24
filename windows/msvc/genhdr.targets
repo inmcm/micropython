@@ -1,67 +1,89 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="GenerateHeaders">
 
-  <Import Project="env.props" Condition="$(PyEnvIncluded)!=True"/>
+  <Import Project="paths.props" Condition="'$(PyPathsIncluded)' != 'True'"/>
 
-  <Target Name="GenerateHeaders" DependsOnTargets="MakeQstrData;MakeVersionHeader">
+  <!--Generate qstrdefs.generated.h and mpversion.h similar to what is done in py/mkrules.mk and py/py.mk-->
+  <Target Name="GenerateHeaders" DependsOnTargets="MakeVersionHdr;MakeQstrData">
   </Target>
 
   <PropertyGroup>
     <DestDir>$(PyBuildDir)genhdr\</DestDir>
+    <PySrcDir>$(PyBaseDir)py\</PySrcDir>
+    <QstrDefs>$(PyBaseDir)unix\qstrdefsport.h</QstrDefs>
+    <PyQstrDefs>$(PySrcDir)qstrdefs.h</PyQstrDefs>
+    <QstrDefsCollected>$(DestDir)qstrdefscollected.h</QstrDefsCollected>
+    <QstrGen>$(DestDir)qstrdefs.generated.h</QstrGen>
+    <PyPython Condition="'$(PyPython)' == ''">python</PyPython>
   </PropertyGroup>
 
   <Target Name="MakeDestDir">
     <MakeDir Directories="$(DestDir)"/>
   </Target>
 
-  <!--see py/py.mk under #qstr data-->
-  <Target Name="MakeQstrData" DependsOnTargets="MakeDestDir">
-    <PropertyGroup>
-      <PySrcDir>$(PyBaseDir)py\</PySrcDir>
-      <PreProc>$(DestDir)qstrdefs.preprocessed.h</PreProc>
-      <QstrDefs>$(PyBaseDir)unix\qstrdefsport.h</QstrDefs>
-      <DestFile>$(DestDir)qstrdefs.generated.h</DestFile>
-      <TmpFile>$(DestFile).tmp</TmpFile>
-    </PropertyGroup>
+  <!-- Concatenate preprocessed files for use with makeqstrdefs.py.
+       Filters out any lines which aren't used by makeqstrdefs.py so the resulting file is
+       hundreds of times smaller and processing in python takes substantially less time-->
+  <UsingTask TaskName="ConcatPreProcFiles" TaskFactory="CodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.v4.0.dll" >
+    <ParameterGroup>
+      <OutputFile Required="true" ParameterType="System.String"/>
+      <InputFiles Required="true" ParameterType="System.String[]"/>
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs">
+        <![CDATA[
+using(var outFile = System.IO.File.CreateText(OutputFile)) {
+  foreach(var inFile in InputFiles)
+    foreach(var line in System.IO.File.ReadAllLines(inFile))
+      if((line.Contains(".c") && line.StartsWith("#line")) || line.Contains("MP_QSTR"))
+        outFile.WriteLine( line );
+}
+        ]]>
+      </Code>
+    </Task>
+  </UsingTask>
+
+  <!-- Preprocess changed files, concatenate and feed into makeqstrdefs.py split/cat-->
+  <Target Name="MakeQstrDefs" DependsOnTargets="MakeDestDir" Inputs="@(ClCompile)" Outputs="$(QstrDefsCollected)">
     <ItemGroup>
       <PyIncDirs Include="$(PyIncDirs)"/>
+      <PreProcDefs Include="%(ClCompile.PreProcessorDefinitions);NO_QSTR;N_X64;N_X86;N_THUMB;N_ARM"/>
+      <PyQstrSourceFiles Include="@(ClCompile)">
+        <OutFile>$([System.String]::new('%(FullPath)').Replace('$(PyBaseDir)', '$(DestDir)qstr\'))</OutFile>
+      </PyQstrSourceFiles>
+      <PyQstrSourceFiles>
+        <OutFile>$([System.IO.Path]::ChangeExtension('%(OutFile)', '.pp'))</OutFile>
+        <OutDir>$([System.IO.Path]::GetDirectoryName('%(OutFile)'))</OutDir>
+      </PyQstrSourceFiles>
+      <PyQstrSourceFiles>
+        <Changed>$([System.DateTime]::Compare($([System.IO.File]::GetLastWriteTime('%(FullPath)')), $([System.IO.File]::GetLastWriteTime('%(OutFile)'))))</Changed>
+      </PyQstrSourceFiles>
     </ItemGroup>
-    <Exec Command="cl /nologo /I@(PyIncDirs, ' /I') /Fi$(PreProc) /P $(PySrcDir)qstrdefs.h"/>
-    <Exec Command="python $(PySrcDir)makeqstrdata.py $(PreProc) $(QstrDefs) > $(TmpFile)"/>
-    <MSBuild Projects="$(MSBuildThisFileFullPath)" Targets="CopyFileIfDifferent" Properties="SourceFile=$(TmpFile);DestFile=$(DestFile)"/>
+
+    <MakeDir Directories="@(PyQstrSourceFiles->'%(OutDir)')"/>
+    <Exec Command="cl /nologo /I@(PyIncDirs, ' /I') /D@(PreProcDefs, ' /D') /Fi%(PyQstrSourceFiles.OutFile) /P %(PyQstrSourceFiles.Identity)"
+          Condition="%(PyQstrSourceFiles.Changed) &gt; 0"/>
+    <ConcatPreProcFiles InputFiles="@(PyQstrSourceFiles->'%(OutFile)')" OutputFile="$(DestDir)qstr.i.last"
+                        Condition="%(PyQstrSourceFiles.Changed) &gt; 0"/>
+    <Exec Command="$(PyPython) $(PySrcDir)makeqstrdefs.py split $(DestDir)qstr.i.last $(DestDir)qstr $(QstrDefsCollected)"/>
+    <Exec Command="$(PyPython) $(PySrcDir)makeqstrdefs.py cat $(DestDir)qstr.i.last $(DestDir)qstr $(QstrDefsCollected)"/>
   </Target>
 
-  <!--see py/py-version.sh-->
-  <Target Name="GetGitState">
-    <Exec Command="git describe --dirty --always" ConsoleToMSBuild="true" IgnoreExitCode="true">
-      <Output TaskParameter="ConsoleOutput" PropertyName="GitTag" />
-    </Exec>
-    <Exec Command="git rev-parse --short HEAD 2>NUL || echo unknown" ConsoleToMSBuild="true" IgnoreExitCode="true">
-      <Output TaskParameter="ConsoleOutput" PropertyName="GitHash" />
-    </Exec>
-    <Exec Command="git diff --no-ext-diff --quiet --exit-code 2>NUL || echo 0" ConsoleToMSBuild="true" IgnoreExitCode="true">
-      <Output TaskParameter="ConsoleOutput" PropertyName="GitFilesAreClean" />
-    </Exec>
-    <Exec Command="git diff-index --cached --quiet HEAD -- 2>NUL || echo 0" ConsoleToMSBuild="true" IgnoreExitCode="true" Condition="'$(GitFilesAreClean)'==''">
-      <Output TaskParameter="ConsoleOutput" PropertyName="GitFilesAreClean" />
-    </Exec>
-  </Target>
-
-  <Target Name="MakeVersionHeader" DependsOnTargets="MakeDestDir;GetGitState">
-    <PropertyGroup Condition="'$(GitFilesAreClean)'=='0'">
-      <GitHash>$(GitHash)-dirty</GitHash>
-    </PropertyGroup>
+  <Target Name="MakeQstrData" DependsOnTargets="MakeQstrDefs" Inputs="$(QstrDefsCollected);$(PyQstrDefs);$(QstrDefs)" Outputs="$(QstrGen)">
     <PropertyGroup>
-      <DestFile>$(DestDir)py-version.h</DestFile>
+      <TmpFile>$(QstrGen).tmp</TmpFile>
+    </PropertyGroup>
+    <Exec Command="cl /nologo /I@(PyIncDirs, ' /I') /D@(PreProcDefs, ' /D') /E $(PyQstrDefs) $(QstrDefs) > $(DestDir)qstrdefspreprocessed.h"/>
+    <Exec Command="$(PyPython) $(PySrcDir)makeqstrdata.py $(DestDir)qstrdefspreprocessed.h $(QstrDefsCollected) > $(TmpFile)"/>
+    <MSBuild Projects="$(MSBuildThisFileFullPath)" Targets="CopyFileIfDifferent" Properties="SourceFile=$(TmpFile);DestFile=$(QstrGen)"/>
+  </Target>
+
+  <Target Name="MakeVersionHdr" DependsOnTargets="MakeDestDir">
+    <PropertyGroup>
+      <DestFile>$(DestDir)mpversion.h</DestFile>
       <TmpFile>$(DestFile).tmp</TmpFile>
     </PropertyGroup>
-    <ItemGroup>
-      <Lines Include="// This file was generated by $([System.IO.Path]::GetFileName(`$(MsBuildThisFile)`))"/>
-      <Lines Include="#define MICROPY_GIT_TAG &quot;$(GitTag)&quot;"/>
-      <Lines Include="#define MICROPY_GIT_HASH &quot;$(GitHash)&quot;"/>
-      <Lines Include="#define MICROPY_BUILD_DATE &quot;$([System.DateTime]::Now.ToString(`yyyy-MM-dd`))&quot;"/>
-    </ItemGroup>
-    <WriteLinesToFile Lines="@(Lines)" File="$(TmpFile)" Overwrite="true"/>
+    <Exec Command="$(PyPython) $(PySrcDir)makeversionhdr.py $(TmpFile)"/>
     <MSBuild Projects="$(MSBuildThisFileFullPath)" Targets="CopyFileIfDifferent" Properties="SourceFile=$(TmpFile);DestFile=$(DestFile)"/>
   </Target>
 

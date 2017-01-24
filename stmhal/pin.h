@@ -24,10 +24,14 @@
  * THE SOFTWARE.
  */
 
+#ifndef __MICROPY_INCLUDED_STMHAL_PIN_H__
+#define __MICROPY_INCLUDED_STMHAL_PIN_H__
+
 // This file requires pin_defs_xxx.h (which has port specific enums and
 // defines, so we include it here. It should never be included directly
 
 #include MICROPY_PIN_DEFS_PORT_H
+#include "py/obj.h"
 
 typedef struct {
   mp_obj_base_t base;
@@ -82,7 +86,7 @@ extern const mp_obj_type_t pin_cpu_pins_obj_type;
 extern const mp_obj_dict_t pin_cpu_pins_locals_dict;
 extern const mp_obj_dict_t pin_board_pins_locals_dict;
 
-MP_DECLARE_CONST_FUN_OBJ(pin_init_obj);
+MP_DECLARE_CONST_FUN_OBJ_KW(pin_init_obj);
 
 void pin_init0(void);
 uint32_t pin_get_mode(const pin_obj_t *pin);
@@ -93,3 +97,5 @@ const pin_obj_t *pin_find_named_pin(const mp_obj_dict_t *named_pins, mp_obj_t na
 const pin_af_obj_t *pin_find_af(const pin_obj_t *pin, uint8_t fn, uint8_t unit);
 const pin_af_obj_t *pin_find_af_by_index(const pin_obj_t *pin, mp_uint_t af_idx);
 const pin_af_obj_t *pin_find_af_by_name(const pin_obj_t *pin, const char *name);
+
+#endif // __MICROPY_INCLUDED_STMHAL_PIN_H__

@@ -26,35 +26,29 @@
 #ifndef __MICROPY_INCLUDED_PY_RUNTIME0_H__
 #define __MICROPY_INCLUDED_PY_RUNTIME0_H__
 
-// taken from python source, Include/code.h
 // These must fit in 8 bits; see scope.h
-#define MP_SCOPE_FLAG_OPTIMISED    0x01
-#define MP_SCOPE_FLAG_NEWLOCALS    0x02
-#define MP_SCOPE_FLAG_VARARGS      0x04
-#define MP_SCOPE_FLAG_VARKEYWORDS  0x08
-#define MP_SCOPE_FLAG_NESTED       0x10
-#define MP_SCOPE_FLAG_GENERATOR    0x20
-/* The MP_SCOPE_FLAG_NOFREE flag is set if there are no free or cell variables.
-   This information is redundant, but it allows a single flag test
-   to determine whether there is any extra work to be done when the
-   call frame is setup.
-*/
-#define MP_SCOPE_FLAG_NOFREE       0x40
+#define MP_SCOPE_FLAG_VARARGS      (0x01)
+#define MP_SCOPE_FLAG_VARKEYWORDS  (0x02)
+#define MP_SCOPE_FLAG_GENERATOR    (0x04)
+#define MP_SCOPE_FLAG_DEFKWARGS    (0x08)
 
 // types for native (viper) function signature
 #define MP_NATIVE_TYPE_OBJ  (0x00)
 #define MP_NATIVE_TYPE_BOOL (0x01)
 #define MP_NATIVE_TYPE_INT  (0x02)
 #define MP_NATIVE_TYPE_UINT (0x03)
+#define MP_NATIVE_TYPE_PTR  (0x04)
+#define MP_NATIVE_TYPE_PTR8 (0x05)
+#define MP_NATIVE_TYPE_PTR16 (0x06)
+#define MP_NATIVE_TYPE_PTR32 (0x07)
 
 typedef enum {
     MP_UNARY_OP_BOOL, // __bool__
     MP_UNARY_OP_LEN, // __len__
+    MP_UNARY_OP_HASH, // __hash__; must return a small int
     MP_UNARY_OP_POSITIVE,
     MP_UNARY_OP_NEGATIVE,
     MP_UNARY_OP_INVERT,
-    // The NOT op is only implemented by bool.  The emitter must synthesise NOT
-    // for other types by calling BOOL then inverting (eg by then calling NOT).
     MP_UNARY_OP_NOT,
 } mp_unary_op_t;
 
@@ -73,29 +67,30 @@ typedef enum {
 
     MP_BINARY_OP_MODULO,
     MP_BINARY_OP_POWER,
+    MP_BINARY_OP_DIVMOD, // not emitted by the compiler but supported by the runtime
     MP_BINARY_OP_INPLACE_OR,
     MP_BINARY_OP_INPLACE_XOR,
-    MP_BINARY_OP_INPLACE_AND,
 
+    MP_BINARY_OP_INPLACE_AND,
     MP_BINARY_OP_INPLACE_LSHIFT,
     MP_BINARY_OP_INPLACE_RSHIFT,
     MP_BINARY_OP_INPLACE_ADD,
     MP_BINARY_OP_INPLACE_SUBTRACT,
-    MP_BINARY_OP_INPLACE_MULTIPLY,
 
+    MP_BINARY_OP_INPLACE_MULTIPLY,
     MP_BINARY_OP_INPLACE_FLOOR_DIVIDE,
     MP_BINARY_OP_INPLACE_TRUE_DIVIDE,
     MP_BINARY_OP_INPLACE_MODULO,
     MP_BINARY_OP_INPLACE_POWER,
+
     // these should return a bool
     MP_BINARY_OP_LESS,
-
     MP_BINARY_OP_MORE,
     MP_BINARY_OP_EQUAL,
     MP_BINARY_OP_LESS_EQUAL,
     MP_BINARY_OP_MORE_EQUAL,
-    MP_BINARY_OP_NOT_EQUAL,
 
+    MP_BINARY_OP_NOT_EQUAL,
     MP_BINARY_OP_IN,
     MP_BINARY_OP_IS,
     MP_BINARY_OP_EXCEPTION_MATCH,
@@ -107,8 +102,6 @@ typedef enum {
 typedef enum {
     MP_F_CONVERT_OBJ_TO_NATIVE = 0,
     MP_F_CONVERT_NATIVE_TO_OBJ,
-    MP_F_LOAD_CONST_STR,
-    MP_F_LOAD_CONST_BYTES,
     MP_F_LOAD_NAME,
     MP_F_LOAD_GLOBAL,
     MP_F_LOAD_BUILD_CLASS,
@@ -133,6 +126,7 @@ typedef enum {
     MP_F_MAKE_FUNCTION_FROM_RAW_CODE,
     MP_F_NATIVE_CALL_FUNCTION_N_KW,
     MP_F_CALL_METHOD_N_KW,
+    MP_F_CALL_METHOD_N_KW_VAR,
     MP_F_GETITER,
     MP_F_ITERNEXT,
     MP_F_NLR_PUSH,
@@ -148,6 +142,9 @@ typedef enum {
     MP_F_UNPACK_EX,
     MP_F_DELETE_NAME,
     MP_F_DELETE_GLOBAL,
+    MP_F_NEW_CELL,
+    MP_F_MAKE_CLOSURE_FROM_RAW_CODE,
+    MP_F_SETUP_CODE_STATE,
     MP_F_NUMBER_OF,
 } mp_fun_kind_t;
 

@@ -15,9 +15,9 @@ desc = {
 bytes = b"01"
 
 addr = uctypes.addressof(bytes)
-buf = addr.to_bytes(uctypes.sizeof(desc))
+buf = addr.to_bytes(uctypes.sizeof(desc), "little")
 
-S = uctypes.struct(desc, uctypes.addressof(buf), uctypes.NATIVE)
+S = uctypes.struct(uctypes.addressof(buf), desc, uctypes.NATIVE)
 
 print(S.ptr[0])
 assert S.ptr[0] == ord("0")

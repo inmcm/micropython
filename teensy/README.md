@@ -1,6 +1,6 @@
 # Build Instructions for Teensy 3.1
 
-Currently the Teensy 3.1 port of Micro Python builds under Linux and not under Windows.
+Currently the Teensy 3.1 port of MicroPython builds under Linux and not under Windows.
 
 The tool chain required for the build can be found at <https://launchpad.net/gcc-arm-embedded>.
 
@@ -56,3 +56,17 @@ include Makefile
 GNUmakefile is not checked into the source code control system, so it will
 retain your settings when updating your source tree. You can also add
 additional Makefile customizations this way.
+
+### Tips for OSX
+
+Set the ARDUINO environment variable to the location where Arduino with TeensyDuino is installed.
+```bash
+export ARDUINO=~/Downloads/Arduino.app/Contents/Java/
+```
+
+Search /dev/ for USB port name, which will be cu.usbmodem followed by a few numbers. The name of the port maybe different depending on the version of OSX.
+To access the Python prompt type: 
+
+```bash
+screen <devicename> 115200
+```

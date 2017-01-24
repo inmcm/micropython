@@ -45,6 +45,8 @@ typedef union {
     };
 } double_s_t;
 
+#if defined(__thumb__)
+
 double __attribute__((pcs("aapcs"))) __aeabi_i2d(int32_t x) {
     return (float)x;
 }
@@ -82,13 +84,7 @@ double __aeabi_dmul(double x , double y) {
 
 }
 
-float sqrtf(float x) {
-    asm volatile (
-            "vsqrt.f32  %[r], %[x]\n"
-            : [r] "=t" (x)
-            : [x] "t"  (x));
-    return x;
-}
+#endif // defined(__thumb__)
 
 #ifndef NDEBUG
 float copysignf(float x, float y) {

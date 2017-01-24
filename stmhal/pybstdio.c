@@ -26,11 +26,11 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
 
 #include "py/obj.h"
 #include "py/stream.h"
-#include MICROPY_HAL_H
+#include "py/mperrno.h"
+#include "py/mphal.h"
 
 // TODO make stdin, stdout and stderr writable objects so they can
 // be changed by Python code.  This requires some changes, as these
@@ -48,9 +48,13 @@ typedef struct _pyb_stdio_obj_t {
     int fd;
 } pyb_stdio_obj_t;
 
-void stdio_obj_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+#if MICROPY_PY_SYS_STDIO_BUFFER
+STATIC const pyb_stdio_obj_t stdio_buffer_obj;
+#endif
+
+void stdio_obj_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     pyb_stdio_obj_t *self = self_in;
-    print(env, "<io.FileIO %d>", self->fd);
+    mp_printf(print, "<io.FileIO %d>", self->fd);
 }
 
 STATIC mp_uint_t stdio_read(mp_obj_t self_in, void *buf, mp_uint_t size, int *errcode) {
@@ -65,7 +69,7 @@ STATIC mp_uint_t stdio_read(mp_obj_t self_in, void *buf, mp_uint_t size, int *er
         }
         return size;
     } else {
-        *errcode = EPERM;
+        *errcode = MP_EPERM;
         return MP_STREAM_ERROR;
     }
 }
@@ -76,12 +80,12 @@ STATIC mp_uint_t stdio_write(mp_obj_t self_in, const void *buf, mp_uint_t size, 
         mp_hal_stdout_tx_strn_cooked(buf, size);
         return size;
     } else {
-        *errcode = EPERM;
+        *errcode = MP_EPERM;
         return MP_STREAM_ERROR;
     }
 }
 
-STATIC mp_obj_t stdio_obj___exit__(mp_uint_t n_args, const mp_obj_t *args) {
+STATIC mp_obj_t stdio_obj___exit__(size_t n_args, const mp_obj_t *args) {
     return mp_const_none;
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(stdio_obj___exit___obj, 4, 4, stdio_obj___exit__);
@@ -89,9 +93,13 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(stdio_obj___exit___obj, 4, 4, stdio_o
 // TODO gc hook to close the file if not already closed
 
 STATIC const mp_map_elem_t stdio_locals_dict_table[] = {
+#if MICROPY_PY_SYS_STDIO_BUFFER
+    { MP_OBJ_NEW_QSTR(MP_QSTR_buffer), (mp_obj_t)&stdio_buffer_obj },
+#endif
     { MP_OBJ_NEW_QSTR(MP_QSTR_read), (mp_obj_t)&mp_stream_read_obj },
-    { MP_OBJ_NEW_QSTR(MP_QSTR_readall), (mp_obj_t)&mp_stream_readall_obj },
+    { MP_OBJ_NEW_QSTR(MP_QSTR_readinto), (mp_obj_t)&mp_stream_readinto_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_readline), (mp_obj_t)&mp_stream_unbuffered_readline_obj},
+    { MP_OBJ_NEW_QSTR(MP_QSTR_readlines), (mp_obj_t)&mp_stream_unbuffered_readlines_obj},
     { MP_OBJ_NEW_QSTR(MP_QSTR_write), (mp_obj_t)&mp_stream_write_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR_close), (mp_obj_t)&mp_identity_obj },
     { MP_OBJ_NEW_QSTR(MP_QSTR___del__), (mp_obj_t)&mp_identity_obj },
@@ -114,10 +122,42 @@ STATIC const mp_obj_type_t stdio_obj_type = {
     .print = stdio_obj_print,
     .getiter = mp_identity,
     .iternext = mp_stream_unbuffered_iter,
-    .stream_p = &stdio_obj_stream_p,
+    .protocol = &stdio_obj_stream_p,
     .locals_dict = (mp_obj_t)&stdio_locals_dict,
 };
 
 const pyb_stdio_obj_t mp_sys_stdin_obj = {{&stdio_obj_type}, .fd = STDIO_FD_IN};
 const pyb_stdio_obj_t mp_sys_stdout_obj = {{&stdio_obj_type}, .fd = STDIO_FD_OUT};
 const pyb_stdio_obj_t mp_sys_stderr_obj = {{&stdio_obj_type}, .fd = STDIO_FD_ERR};
+
+#if MICROPY_PY_SYS_STDIO_BUFFER
+STATIC mp_uint_t stdio_buffer_read(mp_obj_t self_in, void *buf, mp_uint_t size, int *errcode) {
+    for (uint i = 0; i < size; i++) {
+        ((byte*)buf)[i] = mp_hal_stdin_rx_chr();
+    }
+    return size;
+}
+
+STATIC mp_uint_t stdio_buffer_write(mp_obj_t self_in, const void *buf, mp_uint_t size, int *errcode) {
+    mp_hal_stdout_tx_strn(buf, size);
+    return size;
+}
+
+STATIC const mp_stream_p_t stdio_buffer_obj_stream_p = {
+    .read = stdio_buffer_read,
+    .write = stdio_buffer_write,
+    .is_text = false,
+};
+
+STATIC const mp_obj_type_t stdio_buffer_obj_type = {
+    { &mp_type_type },
+    .name = MP_QSTR_FileIO,
+    .print = stdio_obj_print,
+    .getiter = mp_identity,
+    .iternext = mp_stream_unbuffered_iter,
+    .protocol = &stdio_buffer_obj_stream_p,
+    .locals_dict = (mp_obj_t)&stdio_locals_dict,
+};
+
+STATIC const pyb_stdio_obj_t stdio_buffer_obj = {{&stdio_buffer_obj_type}, .fd = 0}; // fd unused
+#endif

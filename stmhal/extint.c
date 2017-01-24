@@ -31,9 +31,10 @@
 #include "py/nlr.h"
 #include "py/runtime.h"
 #include "py/gc.h"
-#include "py/pfenv.h"
+#include "py/mphal.h"
 #include "pin.h"
 #include "extint.h"
+#include "irq.h"
 
 /// \moduleref pyb
 /// \class ExtInt - configure I/O pins to interrupt on external events
@@ -89,8 +90,16 @@
 // register in an atomic fashion by using bitband addressing.
 #define EXTI_MODE_BB(mode, line) (*(__IO uint32_t *)(PERIPH_BB_BASE + ((EXTI_OFFSET + (mode)) * 32) + ((line) * 4)))
 
+#if defined(MCU_SERIES_L4)
+// The L4 MCU supports 40 Events/IRQs lines of the type configurable and direct.
+// Here we only support configurable line types.  Details, see page 330 of RM0351, Rev 1.
+// The USB_FS_WAKUP event is a direct type and there is no support for it.
+#define EXTI_Mode_Interrupt offsetof(EXTI_TypeDef, IMR1)
+#define EXTI_Mode_Event     offsetof(EXTI_TypeDef, EMR1)
+#else
 #define EXTI_Mode_Interrupt offsetof(EXTI_TypeDef, IMR)
 #define EXTI_Mode_Event     offsetof(EXTI_TypeDef, EMR)
+#endif
 
 #define EXTI_SWIER_BB(line) (*(__IO uint32_t *)(PERIPH_BB_BASE + ((EXTI_OFFSET + offsetof(EXTI_TypeDef, SWIER)) * 32) + ((line) * 4)))
 
@@ -102,15 +111,31 @@ typedef struct {
 STATIC uint32_t pyb_extint_mode[EXTI_NUM_VECTORS];
 
 #if !defined(ETH)
-#define ETH_WKUP_IRQn   62  // The 405 doesn't have ETH, but we want a value to put in our table
+#define ETH_WKUP_IRQn   62  // Some MCUs don't have ETH, but we want a value to put in our table
+#endif
+#if !defined(OTG_HS_WKUP_IRQn)
+#define OTG_HS_WKUP_IRQn 76  // Some MCUs don't have HS, but we want a value to put in our table
+#endif
+#if !defined(OTG_FS_WKUP_IRQn)
+#define OTG_FS_WKUP_IRQn 42  // Some MCUs don't have FS IRQ, but we want a value to put in our table
 #endif
 
 STATIC const uint8_t nvic_irq_channel[EXTI_NUM_VECTORS] = {
     EXTI0_IRQn,     EXTI1_IRQn,     EXTI2_IRQn,     EXTI3_IRQn,     EXTI4_IRQn,
     EXTI9_5_IRQn,   EXTI9_5_IRQn,   EXTI9_5_IRQn,   EXTI9_5_IRQn,   EXTI9_5_IRQn,
     EXTI15_10_IRQn, EXTI15_10_IRQn, EXTI15_10_IRQn, EXTI15_10_IRQn, EXTI15_10_IRQn,
-    EXTI15_10_IRQn, PVD_IRQn,       RTC_Alarm_IRQn, OTG_FS_WKUP_IRQn, ETH_WKUP_IRQn,
-    OTG_HS_WKUP_IRQn, TAMP_STAMP_IRQn, RTC_WKUP_IRQn
+    EXTI15_10_IRQn,
+    #if defined(MCU_SERIES_L4)
+    PVD_PVM_IRQn,
+    #else
+    PVD_IRQn,
+    #endif
+    RTC_Alarm_IRQn,
+    OTG_FS_WKUP_IRQn,
+    ETH_WKUP_IRQn,
+    OTG_HS_WKUP_IRQn,
+    TAMP_STAMP_IRQn,
+    RTC_WKUP_IRQn,
 };
 
 // Set override_callback_obj to true if you want to unconditionally set the
@@ -164,6 +189,7 @@ uint extint_register(mp_obj_t pin_obj, uint32_t mode, uint32_t pull, mp_obj_t ca
 
     if (*cb != mp_const_none) {
 
+        mp_hal_gpio_clock_enable(pin->gpio);
         GPIO_InitTypeDef exti;
         exti.Pin = pin->pin_mask;
         exti.Mode = mode;
@@ -174,7 +200,7 @@ uint extint_register(mp_obj_t pin_obj, uint32_t mode, uint32_t pull, mp_obj_t ca
         // Calling HAL_GPIO_Init does an implicit extint_enable
 
         /* Enable and set NVIC Interrupt to the lowest priority */
-        HAL_NVIC_SetPriority(nvic_irq_channel[v_line], 0x0F, 0x0F);
+        HAL_NVIC_SetPriority(nvic_irq_channel[v_line], IRQ_PRI_EXTINT, IRQ_SUBPRI_EXTINT);
         HAL_NVIC_EnableIRQ(nvic_irq_channel[v_line]);
     }
     return v_line;
@@ -184,28 +210,55 @@ void extint_enable(uint line) {
     if (line >= EXTI_NUM_VECTORS) {
         return;
     }
+    #if defined(MCU_SERIES_F7)
+    // The Cortex-M7 doesn't have bitband support.
+    mp_uint_t irq_state = disable_irq();
+    if (pyb_extint_mode[line] == EXTI_Mode_Interrupt) {
+        EXTI->IMR |= (1 << line);
+    } else {
+        EXTI->EMR |= (1 << line);
+    }
+    enable_irq(irq_state);
+    #else
     // Since manipulating IMR/EMR is a read-modify-write, and we want this to
     // be atomic, we use the bit-band area to just affect the bit we're
     // interested in.
     EXTI_MODE_BB(pyb_extint_mode[line], line) = 1;
+    #endif
 }
 
 void extint_disable(uint line) {
     if (line >= EXTI_NUM_VECTORS) {
         return;
     }
+
+    #if defined(MCU_SERIES_F7)
+    // The Cortex-M7 doesn't have bitband support.
+    mp_uint_t irq_state = disable_irq();
+    EXTI->IMR &= ~(1 << line);
+    EXTI->EMR &= ~(1 << line);
+    enable_irq(irq_state);
+    #else
     // Since manipulating IMR/EMR is a read-modify-write, and we want this to
     // be atomic, we use the bit-band area to just affect the bit we're
     // interested in.
     EXTI_MODE_BB(EXTI_Mode_Interrupt, line) = 0;
     EXTI_MODE_BB(EXTI_Mode_Event, line) = 0;
+    #endif
 }
 
 void extint_swint(uint line) {
     if (line >= EXTI_NUM_VECTORS) {
         return;
     }
-    EXTI->SWIER = (1 << line);
+    // we need 0 to 1 transition to trigger the interrupt
+#if defined(MCU_SERIES_L4)
+    EXTI->SWIER1 &= ~(1 << line);
+    EXTI->SWIER1 |= (1 << line);
+#else
+    EXTI->SWIER &= ~(1 << line);
+    EXTI->SWIER |= (1 << line);
+#endif
 }
 
 /// \method line()
@@ -248,12 +301,27 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_1(extint_obj_swint_obj,  extint_obj_swint);
 /// \classmethod regs()
 /// Dump the values of the EXTI registers.
 STATIC mp_obj_t extint_regs(void) {
+    #if defined(MCU_SERIES_L4)
+    printf("EXTI_IMR1   %08lx\n", EXTI->IMR1);
+    printf("EXTI_IMR2   %08lx\n", EXTI->IMR2);
+    printf("EXTI_EMR1   %08lx\n", EXTI->EMR1);
+    printf("EXTI_EMR2   %08lx\n", EXTI->EMR2);
+    printf("EXTI_RTSR1  %08lx\n", EXTI->RTSR1);
+    printf("EXTI_RTSR2  %08lx\n", EXTI->RTSR2);
+    printf("EXTI_FTSR1  %08lx\n", EXTI->FTSR1);
+    printf("EXTI_FTSR2  %08lx\n", EXTI->FTSR2);
+    printf("EXTI_SWIER1 %08lx\n", EXTI->SWIER1);
+    printf("EXTI_SWIER2 %08lx\n", EXTI->SWIER2);
+    printf("EXTI_PR1    %08lx\n", EXTI->PR1);
+    printf("EXTI_PR2    %08lx\n", EXTI->PR2);
+    #else
     printf("EXTI_IMR   %08lx\n", EXTI->IMR);
     printf("EXTI_EMR   %08lx\n", EXTI->EMR);
     printf("EXTI_RTSR  %08lx\n", EXTI->RTSR);
     printf("EXTI_FTSR  %08lx\n", EXTI->FTSR);
     printf("EXTI_SWIER %08lx\n", EXTI->SWIER);
     printf("EXTI_PR    %08lx\n", EXTI->PR);
+    #endif
     return mp_const_none;
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_0(extint_regs_fun_obj, extint_regs);
@@ -282,7 +350,7 @@ STATIC const mp_arg_t pyb_extint_make_new_args[] = {
 };
 #define PYB_EXTINT_MAKE_NEW_NUM_ARGS MP_ARRAY_SIZE(pyb_extint_make_new_args)
 
-STATIC mp_obj_t extint_make_new(mp_obj_t type_in, mp_uint_t n_args, mp_uint_t n_kw, const mp_obj_t *args) {
+STATIC mp_obj_t extint_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     // type_in == extint_obj_type
 
     // parse args
@@ -290,15 +358,15 @@ STATIC mp_obj_t extint_make_new(mp_obj_t type_in, mp_uint_t n_args, mp_uint_t n_
     mp_arg_parse_all_kw_array(n_args, n_kw, args, PYB_EXTINT_MAKE_NEW_NUM_ARGS, pyb_extint_make_new_args, vals);
 
     extint_obj_t *self = m_new_obj(extint_obj_t);
-    self->base.type = type_in;
+    self->base.type = type;
     self->line = extint_register(vals[0].u_obj, vals[1].u_int, vals[2].u_int, vals[3].u_obj, false);
 
     return self;
 }
 
-STATIC void extint_obj_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+STATIC void extint_obj_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     extint_obj_t *self = self_in;
-    print(env, "<ExtInt line=%u>", self->line);
+    mp_printf(print, "<ExtInt line=%u>", self->line);
 }
 
 STATIC const mp_map_elem_t extint_locals_dict_table[] = {
@@ -356,7 +424,7 @@ void Handle_EXTI_Irq(uint32_t line) {
                     *cb = mp_const_none;
                     extint_disable(line);
                     printf("Uncaught exception in ExtInt interrupt handler line %lu\n", line);
-                    mp_obj_print_exception(printf_wrapper, NULL, (mp_obj_t)nlr.ret_val);
+                    mp_obj_print_exception(&mp_plat_print, (mp_obj_t)nlr.ret_val);
                 }
                 gc_unlock();
             }

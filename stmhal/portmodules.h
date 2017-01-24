@@ -28,11 +28,12 @@ extern const mp_obj_module_t pyb_module;
 extern const mp_obj_module_t stm_module;
 extern const mp_obj_module_t mp_module_uos;
 extern const mp_obj_module_t mp_module_utime;
-extern const mp_obj_module_t mp_module_uselect;
 extern const mp_obj_module_t mp_module_usocket;
 
 // additional helper functions exported by the modules
 
-MP_DECLARE_CONST_FUN_OBJ(mod_os_sync_obj);
+MP_DECLARE_CONST_FUN_OBJ_1(time_sleep_ms_obj);
+MP_DECLARE_CONST_FUN_OBJ_1(time_sleep_us_obj);
 
-mp_uint_t mod_time_seconds_since_2000(mp_uint_t year, mp_uint_t month, mp_uint_t date, mp_uint_t hour, mp_uint_t minute, mp_uint_t second);
+MP_DECLARE_CONST_FUN_OBJ_0(mod_os_sync_obj);
+MP_DECLARE_CONST_FUN_OBJ_VAR_BETWEEN(mod_os_dupterm_obj);

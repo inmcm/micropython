@@ -34,20 +34,12 @@ typedef struct _mp_obj_none_t {
     mp_obj_base_t base;
 } mp_obj_none_t;
 
-STATIC void none_print(void (*print)(void *env, const char *fmt, ...), void *env, mp_obj_t self_in, mp_print_kind_t kind) {
+STATIC void none_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     (void)self_in;
     if (MICROPY_PY_UJSON && kind == PRINT_JSON) {
-        print(env, "null");
+        mp_print_str(print, "null");
     } else {
-        print(env, "None");
-    }
-}
-
-STATIC mp_obj_t none_unary_op(mp_uint_t op, mp_obj_t o_in) {
-    (void)o_in;
-    switch (op) {
-        case MP_UNARY_OP_BOOL: return mp_const_false;
-        default: return MP_OBJ_NULL; // op not supported
+        mp_print_str(print, "None");
     }
 }
 
@@ -55,7 +47,7 @@ const mp_obj_type_t mp_type_NoneType = {
     { &mp_type_type },
     .name = MP_QSTR_NoneType,
     .print = none_print,
-    .unary_op = none_unary_op,
+    .unary_op = mp_generic_unary_op,
 };
 
 const mp_obj_none_t mp_const_none_obj = {{&mp_type_NoneType}};

@@ -1,13 +1,18 @@
 # test construction of array.array from different objects
 
-from array import array
+try:
+    from array import array
+except ImportError:
+    import sys
+    print("SKIP")
+    sys.exit()
 
 # tuple, list
 print(array('b', (1, 2)))
 print(array('h', [1, 2]))
 
 # raw copy from bytes, bytearray
-print(array('h', b'12'))
+print(array('h', b'22'))  # should be byteorder-neutral
 print(array('h', bytearray(2)))
 print(array('i', bytearray(4)))
 

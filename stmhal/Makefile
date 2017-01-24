@@ -10,59 +10,81 @@ BUILD ?= build-$(BOARD)
 
 include ../py/mkenv.mk
 -include mpconfigport.mk
+include boards/$(BOARD)/mpconfigboard.mk
 
 # qstr definitions (must come before including py.mk)
-QSTR_DEFS = qstrdefsport.h $(BUILD)/pins_qstr.h
+QSTR_DEFS = qstrdefsport.h $(BUILD)/pins_qstr.h $(BUILD)/modstm_qstr.h
+
+# directory containing scripts to be frozen as bytecode
+FROZEN_MPY_DIR ?= modules
 
 # include py core make definitions
 include ../py/py.mk
 
+LD_DIR=boards
 CMSIS_DIR=cmsis
-HAL_DIR=hal
+HAL_DIR=hal/$(MCU_SERIES)
 USBDEV_DIR=usbdev
 #USBHOST_DIR=usbhost
 FATFS_DIR=lib/fatfs
 DFU=../tools/dfu.py
 # may need to prefix dfu-util with sudo
-USE_PYDFU ?= 0
-PYDFU = ../tools/pydfu.py
+USE_PYDFU ?= 1
+PYDFU ?= ../tools/pydfu.py
 DFU_UTIL ?= dfu-util
 DEVICE=0483:df11
+STFLASH ?= st-flash
+OPENOCD ?= openocd
+OPENOCD_CONFIG ?= boards/openocd_stm32f4.cfg
 
 CROSS_COMPILE = arm-none-eabi-
 
-INC =  -I.
+INC += -I.
 INC += -I..
 INC += -I$(BUILD)
-INC += -I$(CMSIS_DIR)/inc
-INC += -I$(CMSIS_DIR)/devinc
+INC += -I../lib/cmsis/inc
+INC += -I$(CMSIS_DIR)/
 INC += -I$(HAL_DIR)/inc
 INC += -I$(USBDEV_DIR)/core/inc -I$(USBDEV_DIR)/class/inc
 #INC += -I$(USBHOST_DIR)
 INC += -I../lib/mp-readline
+INC += -I../lib/netutils
+INC += -I../lib/timeutils
 
-CFLAGS_CORTEX_M4 = -mthumb -mtune=cortex-m4 -mabi=aapcs-linux -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -fsingle-precision-constant -Wdouble-promotion
-CFLAGS = $(INC) -Wall -Wpointer-arith -Werror -ansi -std=gnu99 -nostdlib $(CFLAGS_MOD) $(CFLAGS_CORTEX_M4) $(COPT)
+CFLAGS_CORTEX_M = -mthumb -mabi=aapcs-linux -mfpu=fpv4-sp-d16 -mfloat-abi=hard -fsingle-precision-constant -Wdouble-promotion
+CFLAGS_MCU_f4 = $(CFLAGS_CORTEX_M) -mtune=cortex-m4 -mcpu=cortex-m4 -DMCU_SERIES_F4
+CFLAGS_MCU_f7 = $(CFLAGS_CORTEX_M) -mtune=cortex-m7 -mcpu=cortex-m7 -DMCU_SERIES_F7
+CFLAGS_MCU_l4 = $(CFLAGS_CORTEX_M) -mtune=cortex-m4 -mcpu=cortex-m4 -DMCU_SERIES_L4
+
+CFLAGS = $(INC) -Wall -Wpointer-arith -Werror -ansi -std=gnu99 -nostdlib $(CFLAGS_MOD)
+CFLAGS += -D$(CMSIS_MCU)
+CFLAGS += $(CFLAGS_MCU_$(MCU_SERIES))
+CFLAGS += $(COPT)
 CFLAGS += -Iboards/$(BOARD)
+CFLAGS += -DSTM32_HAL_H='<stm32$(MCU_SERIES)xx_hal.h>'
 
-LDFLAGS = -nostdlib -T stm32f405.ld -Map=$(@:.elf=.map) --cref
+LDFLAGS = -nostdlib -L $(LD_DIR) -T $(LD_FILE) -Map=$(@:.elf=.map) --cref
 LIBS =
+
+# Remove uncalled code from the final image.
+CFLAGS += -fdata-sections -ffunction-sections
+LDFLAGS += --gc-sections
 
 # Debugging/Optimization
 ifeq ($(DEBUG), 1)
 CFLAGS += -g -DPENDSV_DEBUG
 COPT = -O0
 else
-CFLAGS += -fdata-sections -ffunction-sections
 COPT += -Os -DNDEBUG
-LDFLAGS += --gc-sections
 endif
 
 # uncomment this if you want libgcc
-#LIBS += $(shell $(CC) -print-libgcc-file-name)
+#LIBS += $(shell $(CC) $(CFLAGS) -print-libgcc-file-name)
 
 SRC_LIB = $(addprefix lib/,\
+	libc/string0.c \
 	libm/math.c \
+	libm/thumb_vfp_sqrtf.c \
 	libm/asinfacosf.c \
 	libm/atanf.c \
 	libm/atan2f.c \
@@ -90,18 +112,25 @@ SRC_LIB = $(addprefix lib/,\
 	fatfs/ff.c \
 	fatfs/option/ccsbcs.c \
 	mp-readline/readline.c \
+	netutils/netutils.c \
+	timeutils/timeutils.c \
+	utils/pyexec.c \
+	)
+
+DRIVERS_SRC_C = $(addprefix drivers/,\
+	memory/spiflash.c \
 	)
 
 SRC_C = \
 	main.c \
-	string0.c \
-	system_stm32f4xx.c \
-	stm32f4xx_it.c \
+	system_stm32.c \
+	stm32_it.c \
 	usbd_conf.c \
 	usbd_desc.c \
 	usbd_cdc_interface.c \
+	usbd_hid_interface.c \
 	usbd_msc_storage.c \
-	mphal.c \
+	mphalport.c \
 	irq.c \
 	pendsv.c \
 	systick.c  \
@@ -111,75 +140,75 @@ SRC_C = \
 	pin_defs_stmhal.c \
 	pin_named_pins.c \
 	bufhelper.c \
+	dma.c \
 	i2c.c \
 	spi.c \
 	uart.c \
 	can.c \
 	usb.c \
-	printf.c \
+	wdt.c \
 	gccollect.c \
 	pybstdio.c \
-	pyexec.c \
 	help.c \
 	input.c \
+	machine_i2c.c \
+	modmachine.c \
 	modpyb.c \
 	modstm.c \
 	moduos.c \
 	modutime.c \
-	moduselect.c \
 	modusocket.c \
 	modnetwork.c \
 	import.c \
-	lexerfatfs.c \
 	extint.c \
 	usrsw.c \
 	rng.c \
 	rtc.c \
 	flash.c \
 	storage.c \
-	file.c \
+	builtin_open.c \
 	sdcard.c \
-	fsusermount.c \
-	diskio.c \
-	ffconf.c \
+	fatfs_port.c \
 	lcd.c \
 	accel.c \
 	servo.c \
 	dac.c \
 	adc.c \
+	$(wildcard boards/$(BOARD)/*.c)
 
-SRC_S = \
-	startup_stm32f40xx.s \
-	gchelper.s \
+SRC_O = \
+	startup_stm32.o \
+	gchelper.o \
 
-SRC_HAL = $(addprefix $(HAL_DIR)/src/,\
-	stm32f4xx_hal.c \
-	stm32f4xx_hal_adc.c \
-	stm32f4xx_hal_adc_ex.c \
-	stm32f4xx_hal_can.c \
-	stm32f4xx_hal_cortex.c \
-	stm32f4xx_hal_dac.c \
-	stm32f4xx_hal_dac_ex.c \
-	stm32f4xx_hal_dma.c \
-	stm32f4xx_hal_flash.c \
-	stm32f4xx_hal_flash_ex.c \
-	stm32f4xx_hal_gpio.c \
-	stm32f4xx_hal_i2c.c \
-	stm32f4xx_hal_pcd.c \
-	stm32f4xx_hal_pcd_ex.c \
-	stm32f4xx_hal_pwr.c \
-	stm32f4xx_hal_rcc.c \
-	stm32f4xx_hal_rcc_ex.c \
-	stm32f4xx_hal_rng.c \
-	stm32f4xx_hal_rtc.c \
-	stm32f4xx_hal_rtc_ex.c \
-	stm32f4xx_hal_sd.c \
-	stm32f4xx_hal_spi.c \
-	stm32f4xx_hal_tim.c \
-	stm32f4xx_hal_tim_ex.c \
-	stm32f4xx_hal_uart.c \
-	stm32f4xx_ll_sdmmc.c \
-	stm32f4xx_ll_usb.c \
+SRC_HAL = $(addprefix $(HAL_DIR)/src/stm32$(MCU_SERIES)xx_,\
+	hal.c \
+	hal_adc.c \
+	hal_adc_ex.c \
+	hal_can.c \
+	hal_cortex.c \
+	hal_dac.c \
+	hal_dac_ex.c \
+	hal_dma.c \
+	hal_flash.c \
+	hal_flash_ex.c \
+	hal_gpio.c \
+	hal_i2c.c \
+	hal_pcd.c \
+	hal_pcd_ex.c \
+	hal_pwr.c \
+	hal_pwr_ex.c \
+	hal_rcc.c \
+	hal_rcc_ex.c \
+	hal_rng.c \
+	hal_rtc.c \
+	hal_rtc_ex.c \
+	hal_sd.c \
+	hal_spi.c \
+	hal_tim.c \
+	hal_tim_ex.c \
+	hal_uart.c \
+	ll_sdmmc.c \
+	ll_usb.c \
 	)
 
 SRC_USBDEV = $(addprefix $(USBDEV_DIR)/,\
@@ -231,21 +260,38 @@ endif
 OBJ =
 OBJ += $(PY_O)
 OBJ += $(addprefix $(BUILD)/, $(SRC_LIB:.c=.o))
+OBJ += $(addprefix $(BUILD)/, $(DRIVERS_SRC_C:.c=.o))
 OBJ += $(addprefix $(BUILD)/, $(SRC_C:.c=.o))
-OBJ += $(addprefix $(BUILD)/, $(SRC_S:.s=.o))
+OBJ += $(addprefix $(BUILD)/, $(SRC_O))
 OBJ += $(addprefix $(BUILD)/, $(SRC_HAL:.c=.o))
 OBJ += $(addprefix $(BUILD)/, $(SRC_USBDEV:.c=.o))
 OBJ += $(addprefix $(BUILD)/, $(SRC_MOD:.c=.o))
 OBJ += $(BUILD)/pins_$(BOARD).o
 
-# We put ff.o and stm32f4xx_hal_sd.o into the first 16K section with the ISRs.
+# We put several files into the first 16K section with the ISRs.
 # If we compile these using -O0 then it won't fit. So if you really want these
-# to be compiled with -O0, then edit stm32f405.ld (in the .isr_vector section)
-# and comment out the following 2 lines.
+# to be compiled with -O0, then edit boards/common.ld (in the .isr_vector section)
+# and comment out the following lines.
 $(BUILD)/$(FATFS_DIR)/ff.o: COPT += -Os
-$(BUILD)/$(HAL_DIR)/src/stm32f4xx_hal_sd.o: COPT += -Os
+$(filter $(PY_BUILD)/../extmod/vfs_fat_%.o, $(PY_O)): COPT += -Os
+$(PY_BUILD)/formatfloat.o: COPT += -Os
+$(PY_BUILD)/parsenum.o: COPT += -Os
+$(PY_BUILD)/mpprint.o: COPT += -Os
 
 all: $(BUILD)/firmware.dfu $(BUILD)/firmware.hex
+
+ifneq ($(FROZEN_DIR),)
+# To use frozen source modules, put your .py files in a subdirectory (eg scripts/)
+# and then invoke make with FROZEN_DIR=scripts (be sure to build from scratch).
+CFLAGS += -DMICROPY_MODULE_FROZEN_STR
+endif
+
+ifneq ($(FROZEN_MPY_DIR),)
+# To use frozen bytecode, put your .py files in a subdirectory (eg frozen/) and
+# then invoke make with FROZEN_MPY_DIR=frozen (be sure to build from scratch).
+CFLAGS += -DMICROPY_QSTR_EXTRA_POOL=mp_qstr_frozen_const_pool
+CFLAGS += -DMICROPY_MODULE_FROZEN_MPY
+endif
 
 .PHONY: deploy
 
@@ -257,11 +303,24 @@ else
 	$(Q)$(DFU_UTIL) -a 0 -d $(DEVICE) -D $<
 endif
 
+FLASH_ADDR ?= 0x08000000
+TEXT_ADDR ?= 0x08020000
+
+deploy-stlink: $(BUILD)/firmware.dfu
+	$(ECHO) "Writing $(BUILD)/firmware0.bin to the board via ST-LINK"
+	$(Q)$(STFLASH) write $(BUILD)/firmware0.bin $(FLASH_ADDR)
+	$(ECHO) "Writing $(BUILD)/firmware1.bin to the board via ST-LINK"
+	$(Q)$(STFLASH) --reset write $(BUILD)/firmware1.bin $(TEXT_ADDR)
+
+deploy-openocd: $(BUILD)/firmware.dfu
+	$(ECHO) "Writing $(BUILD)/firmware{0,1}.bin to the board via ST-LINK using OpenOCD"
+	$(Q)$(OPENOCD) -f $(OPENOCD_CONFIG) -c "stm_flash $(BUILD)/firmware0.bin $(FLASH_ADDR) $(BUILD)/firmware1.bin $(TEXT_ADDR)"
+
 $(BUILD)/firmware.dfu: $(BUILD)/firmware.elf
 	$(ECHO) "Create $@"
 	$(Q)$(OBJCOPY) -O binary -j .isr_vector $^ $(BUILD)/firmware0.bin
 	$(Q)$(OBJCOPY) -O binary -j .text -j .data $^ $(BUILD)/firmware1.bin
-	$(Q)$(PYTHON) $(DFU) -b 0x08000000:$(BUILD)/firmware0.bin -b 0x08020000:$(BUILD)/firmware1.bin $@
+	$(Q)$(PYTHON) $(DFU) -b $(FLASH_ADDR):$(BUILD)/firmware0.bin -b $(TEXT_ADDR):$(BUILD)/firmware1.bin $@
 
 $(BUILD)/firmware.hex: $(BUILD)/firmware.elf
 	$(ECHO) "Create $@"
@@ -269,12 +328,11 @@ $(BUILD)/firmware.hex: $(BUILD)/firmware.elf
 
 $(BUILD)/firmware.elf: $(OBJ)
 	$(ECHO) "LINK $@"
-	$(Q)$(LD) $(LDFLAGS) -o $@ $(OBJ) $(LIBS)
+	$(Q)$(LD) $(LDFLAGS) -o $@ $^ $(LIBS)
 	$(Q)$(SIZE) $@
 
 MAKE_PINS = boards/make-pins.py
 BOARD_PINS = boards/$(BOARD)/pins.csv
-AF_FILE = boards/stm32f4xx_af.csv
 PREFIX_FILE = boards/stm32f4xx_prefix.c
 GEN_PINS_SRC = $(BUILD)/pins_$(BOARD).c
 GEN_PINS_HDR = $(HEADER_BUILD)/pins.h
@@ -285,10 +343,16 @@ GEN_PINS_AF_PY = $(BUILD)/pins_af.py
 INSERT_USB_IDS = ../tools/insert-usb-ids.py
 FILE2H = ../tools/file2h.py
 
-USB_IDS_FILE = usbd_desc.c
+USB_IDS_FILE = usb.h
 CDCINF_TEMPLATE = pybcdc.inf_template
 GEN_CDCINF_FILE = $(HEADER_BUILD)/pybcdc.inf
 GEN_CDCINF_HEADER = $(HEADER_BUILD)/pybcdc_inf.h
+
+# List of sources for qstr extraction
+SRC_QSTR += $(SRC_C) $(SRC_MOD) $(SRC_LIB)
+# Append any auto-generated sources that are needed by sources listed in
+# SRC_QSTR
+SRC_QSTR_AUTO_DEPS += $(GEN_CDCINF_HEADER)
 
 # Making OBJ use an order-only depenedency on the generated pins.h file
 # has the side effect of making the pins.h file before we actually compile
@@ -297,7 +361,12 @@ GEN_CDCINF_HEADER = $(HEADER_BUILD)/pybcdc_inf.h
 # which source files might need it.
 $(OBJ): | $(HEADER_BUILD)/pins.h
 
-$(BUILD)/main.o: $(GEN_CDCINF_HEADER)
+# With conditional pins, we may need to regenerate qstrdefs.h when config
+# options change.
+$(HEADER_BUILD)/qstrdefs.generated.h: boards/$(BOARD)/mpconfigboard.h
+
+# main.c can't be even preprocessed without $(GEN_CDCINF_HEADER)
+main.c: $(GEN_CDCINF_HEADER)
 
 # Use a pattern rule here so that make will only call make-pins.py once to make
 # both pins_$(BOARD).c and pins.h
@@ -308,11 +377,24 @@ $(BUILD)/%_$(BOARD).c $(HEADER_BUILD)/%.h $(HEADER_BUILD)/%_af_const.h $(BUILD)/
 $(BUILD)/pins_$(BOARD).o: $(BUILD)/pins_$(BOARD).c
 	$(call compile_c)
 
-$(GEN_CDCINF_HEADER): $(GEN_CDCINF_FILE) $(FILE2H)
+GEN_STMCONST_HDR = $(HEADER_BUILD)/modstm_const.h
+GEN_STMCONST_QSTR = $(BUILD)/modstm_qstr.h
+GEN_STMCONST_MPZ = $(HEADER_BUILD)/modstm_mpz.h
+CMSIS_MCU_LOWER = $(shell echo $(CMSIS_MCU) | tr '[:upper:]' '[:lower:]')
+CMSIS_MCU_HDR = cmsis/$(CMSIS_MCU_LOWER).h
+
+$(BUILD)/modstm.o: $(GEN_STMCONST_HDR)
+# Use a pattern rule here so that make will only call make-stmconst.py once to
+# make both modstm_const.h and modstm_qstr.h
+$(HEADER_BUILD)/%_const.h $(BUILD)/%_qstr.h: $(CMSIS_MCU_HDR) make-stmconst.py | $(HEADER_BUILD)
+	$(ECHO) "Create stmconst $@"
+	$(Q)$(PYTHON) make-stmconst.py --qstr $(GEN_STMCONST_QSTR) --mpz $(GEN_STMCONST_MPZ) $(CMSIS_MCU_HDR) > $(GEN_STMCONST_HDR)
+
+$(GEN_CDCINF_HEADER): $(GEN_CDCINF_FILE) $(FILE2H) | $(HEADER_BUILD)
 	$(ECHO) "Create $@"
 	$(Q)$(PYTHON) $(FILE2H) $< > $@
 
-$(GEN_CDCINF_FILE): $(CDCINF_TEMPLATE) $(INSERT_USB_IDS) $(USB_IDS_FILE)
+$(GEN_CDCINF_FILE): $(CDCINF_TEMPLATE) $(INSERT_USB_IDS) $(USB_IDS_FILE) | $(HEADER_BUILD)
 	$(ECHO) "Create $@"
 	$(Q)$(PYTHON) $(INSERT_USB_IDS) $(USB_IDS_FILE) $< > $@
 

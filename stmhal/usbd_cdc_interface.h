@@ -29,13 +29,10 @@
   ******************************************************************************
   */
 
-extern TIM_HandleTypeDef TIM3_Handle;
 extern const USBD_CDC_ItfTypeDef USBD_CDC_fops;
 
-void USBD_CDC_HAL_TIM_PeriodElapsedCallback(void);
-
 int USBD_CDC_IsConnected(void);
-void USBD_CDC_SetInterrupt(int chr, void *data);
+void USBD_CDC_SetInterrupt(int chr);
 
 int USBD_CDC_TxHalfEmpty(void);
 int USBD_CDC_Tx(const uint8_t *buf, uint32_t len, uint32_t timeout);

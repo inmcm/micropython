@@ -25,13 +25,14 @@
  * THE SOFTWARE.
  */
 
-#include <std.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
 #include "py/mpconfig.h"
-#include MICROPY_HAL_H
 #include "py/obj.h"
+#include "py/runtime.h"
+#include "py/mphal.h"
 #include "hw_ints.h"
 #include "hw_types.h"
 #include "hw_gpio.h"
@@ -40,7 +41,10 @@
 #include "hw_common_reg.h"
 #include "pin.h"
 #include "gpio.h"
-#include "rom.h"
+#ifndef BOOTLOADER
+#include "pybpin.h"
+#include "pins.h"
+#endif
 #include "rom_map.h"
 #include "prcm.h"
 #include "pybuart.h"
@@ -51,10 +55,10 @@
 /******************************************************************************
  DEFINE CONSTANTS
  ******************************************************************************/
-#define MPERROR_TOOGLE_MS                           (40)
-#define MPERROR_SIGNAL_ERROR_MS                     (1000)
+#define MPERROR_TOOGLE_MS                           (50)
+#define MPERROR_SIGNAL_ERROR_MS                     (1200)
 #define MPERROR_HEARTBEAT_ON_MS                     (80)
-#define MPERROR_HEARTBEAT_OFF_MS                    (4920)
+#define MPERROR_HEARTBEAT_OFF_MS                    (3920)
 
 /******************************************************************************
  DECLARE PRIVATE DATA
@@ -64,40 +68,31 @@ struct mperror_heart_beat {
     uint32_t on_time;
     bool beating;
     bool enabled;
-} mperror_heart_beat;
-
-/******************************************************************************
- DEFINE PRIVATE FUNCTIONS
- ******************************************************************************/
-STATIC void mperror_heartbeat_switch_off (void) {
-    MAP_GPIOPinWrite(MICROPY_SYS_LED_PORT, MICROPY_SYS_LED_PORT_PIN, 0);
-}
+    bool do_disable;
+} mperror_heart_beat = {.off_time = 0, .on_time = 0, .beating = false, .enabled = false, .do_disable = false};
 
 /******************************************************************************
  DEFINE PUBLIC FUNCTIONS
  ******************************************************************************/
 void mperror_init0 (void) {
-    // Enable SYS GPIOs peripheral clocks
+#ifdef BOOTLOADER
+    // enable the system led and the safe boot pin peripheral clocks
     MAP_PRCMPeripheralClkEnable(MICROPY_SYS_LED_PRCM, PRCM_RUN_MODE_CLK | PRCM_SLP_MODE_CLK);
-#ifdef BOOTLOADER
     MAP_PRCMPeripheralClkEnable(MICROPY_SAFE_BOOT_PRCM, PRCM_RUN_MODE_CLK | PRCM_SLP_MODE_CLK);
-#endif
-
-    // Configure the bld
-    MAP_PinTypeGPIO(MICROPY_SYS_LED_PIN_NUM, PIN_MODE_0, false);
-    MAP_PinConfigSet(MICROPY_SYS_LED_PIN_NUM, PIN_STRENGTH_6MA, PIN_TYPE_STD);
-    MAP_GPIODirModeSet(MICROPY_SYS_LED_PORT, MICROPY_SYS_LED_PORT_PIN, GPIO_DIR_MODE_OUT);
-
-#ifdef BOOTLOADER
-    // Configure the safe boot pin
+    // configure the safe boot pin
     MAP_PinTypeGPIO(MICROPY_SAFE_BOOT_PIN_NUM, PIN_MODE_0, false);
     MAP_PinConfigSet(MICROPY_SAFE_BOOT_PIN_NUM, PIN_STRENGTH_4MA, PIN_TYPE_STD_PD);
     MAP_GPIODirModeSet(MICROPY_SAFE_BOOT_PORT, MICROPY_SAFE_BOOT_PORT_PIN, GPIO_DIR_MODE_IN);
+    // configure the bld
+    MAP_PinTypeGPIO(MICROPY_SYS_LED_PIN_NUM, PIN_MODE_0, false);
+    MAP_PinConfigSet(MICROPY_SYS_LED_PIN_NUM, PIN_STRENGTH_6MA, PIN_TYPE_STD);
+    MAP_GPIODirModeSet(MICROPY_SYS_LED_PORT, MICROPY_SYS_LED_PORT_PIN, GPIO_DIR_MODE_OUT);
+#else
+    // configure the system led
+    pin_config ((pin_obj_t *)&MICROPY_SYS_LED_GPIO, PIN_MODE_0, GPIO_DIR_MODE_OUT, PIN_TYPE_STD, 0, PIN_STRENGTH_6MA);
 #endif
-
-    mperror_heart_beat.on_time = 0;
-    mperror_heart_beat.off_time = 0;
-    mperror_heart_beat.beating = false;
+    mperror_heart_beat.enabled = true;
+    mperror_heartbeat_switch_off();
 }
 
 void mperror_bootloader_check_reset_cause (void) {
@@ -114,8 +109,8 @@ void mperror_bootloader_check_reset_cause (void) {
         HWREG(0x4402F024) &= 0xF7FFFFFF;
 
         // since the reset cause will be changed, we must store the right reason
-        // so that the application knows we booting the next time
-        PRCMSignalWDTReset();
+        // so that the application knows it when booting for the next time
+        PRCMSetSpecialBit(PRCM_WDT_RESET_BIT);
 
         MAP_PRCMHibernateWakeupSourceEnable(PRCM_HIB_SLOW_CLK_CTR);
         // set the sleep interval to 10ms
@@ -138,26 +133,26 @@ void mperror_signal_error (void) {
     }
 }
 
-void mperror_enable_heartbeat (void) {
-    mperror_heart_beat.enabled = true;
-}
-
-void mperror_disable_heartbeat (void) {
-    mperror_heart_beat.enabled = false;
-    mperror_heartbeat_switch_off();
+void mperror_heartbeat_switch_off (void) {
+    if (mperror_heart_beat.enabled) {
+        mperror_heart_beat.on_time = 0;
+        mperror_heart_beat.off_time = 0;
+        MAP_GPIOPinWrite(MICROPY_SYS_LED_PORT, MICROPY_SYS_LED_PORT_PIN, 0);
+    }
 }
 
 void mperror_heartbeat_signal (void) {
-    if (mperror_heart_beat.enabled) {
+    if (mperror_heart_beat.do_disable) {
+        mperror_heart_beat.do_disable = false;
+    } else if (mperror_heart_beat.enabled) {
         if (!mperror_heart_beat.beating) {
-            if ((mperror_heart_beat.on_time = HAL_GetTick()) - mperror_heart_beat.off_time > MPERROR_HEARTBEAT_OFF_MS) {
+            if ((mperror_heart_beat.on_time = mp_hal_ticks_ms()) - mperror_heart_beat.off_time > MPERROR_HEARTBEAT_OFF_MS) {
                 MAP_GPIOPinWrite(MICROPY_SYS_LED_PORT, MICROPY_SYS_LED_PORT_PIN, MICROPY_SYS_LED_PORT_PIN);
                 mperror_heart_beat.beating = true;
             }
-        }
-        else {
-            if ((mperror_heart_beat.off_time = HAL_GetTick()) - mperror_heart_beat.on_time > MPERROR_HEARTBEAT_ON_MS) {
-                mperror_heartbeat_switch_off();
+        } else {
+            if ((mperror_heart_beat.off_time = mp_hal_ticks_ms()) - mperror_heart_beat.on_time > MPERROR_HEARTBEAT_ON_MS) {
+                MAP_GPIOPinWrite(MICROPY_SYS_LED_PORT, MICROPY_SYS_LED_PORT_PIN, 0);
                 mperror_heart_beat.beating = false;
             }
         }
@@ -195,37 +190,21 @@ void nlr_jump_fail(void *val) {
 #endif
 }
 
-#ifndef BOOTLOADER
-/******************************************************************************/
-// Micro Python bindings
-
-/// \function enable()
-/// Enables the heartbeat signal
-STATIC mp_obj_t pyb_enable_heartbeat(mp_obj_t self) {
-    mperror_enable_heartbeat ();
-    return mp_const_none;
+void mperror_enable_heartbeat (bool enable) {
+    if (enable) {
+    #ifndef BOOTLOADER
+        // configure the led again
+        pin_config ((pin_obj_t *)&MICROPY_SYS_LED_GPIO, PIN_MODE_0, GPIO_DIR_MODE_OUT, PIN_TYPE_STD, 0, PIN_STRENGTH_6MA);
+    #endif
+        mperror_heart_beat.enabled = true;
+        mperror_heart_beat.do_disable = false;
+        mperror_heartbeat_switch_off();
+    } else {
+        mperror_heart_beat.do_disable = true;
+        mperror_heart_beat.enabled = false;
+    }
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_1(pyb_enable_heartbeat_obj, pyb_enable_heartbeat);
 
-/// \function disable()
-/// Disables the heartbeat signal
-STATIC mp_obj_t pyb_disable_heartbeat(mp_obj_t self) {
-    mperror_disable_heartbeat ();
-    return mp_const_none;
+bool mperror_is_heartbeat_enabled (void) {
+    return mperror_heart_beat.enabled;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_1(pyb_disable_heartbeat_obj, pyb_disable_heartbeat);
-
-STATIC const mp_map_elem_t pyb_heartbeat_locals_dict_table[] = {
-    { MP_OBJ_NEW_QSTR(MP_QSTR_enable),    (mp_obj_t)&pyb_enable_heartbeat_obj },
-    { MP_OBJ_NEW_QSTR(MP_QSTR_disable),   (mp_obj_t)&pyb_disable_heartbeat_obj },
-};
-STATIC MP_DEFINE_CONST_DICT(pyb_heartbeat_locals_dict, pyb_heartbeat_locals_dict_table);
-
-static const mp_obj_type_t pyb_heartbeat_type = {
-    { &mp_type_type },
-    .name = MP_QSTR_HeartBeat,
-    .locals_dict = (mp_obj_t)&pyb_heartbeat_locals_dict,
-};
-
-const mp_obj_base_t pyb_heartbeat_obj = {&pyb_heartbeat_type};
-#endif

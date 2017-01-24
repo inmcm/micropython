@@ -29,31 +29,27 @@
 #include "py/gc.h"
 #include "gccollect.h"
 
-STATIC uint32_t stack_end;
+// As we do not have control over the application entry point, there is no way
+// to figure out the real stack base on runtime, so it needs to be hardcoded
+#define STACK_END   0x40000000
 
 mp_uint_t gc_helper_get_regs_and_sp(mp_uint_t *regs);
-
-void gc_collect_init(void) {
-    mp_uint_t regs[8];
-    mp_uint_t sp = gc_helper_get_regs_and_sp(regs);
-    stack_end = sp;
-    //printf("stack=%p ram_end=%p %d\n", stack_end, &_ram_end);
-}
 
 void gc_collect(void) {
     // start the GC
     gc_collect_start();
-
-    // We need to scan everything in RAM that can hold a pointer.
-    // The data segment is used, but should not contain pointers, so we just scan the bss.
-    gc_collect_root((void**)&_bss_start, ((uint32_t)&_bss_end - (uint32_t)&_bss_start) / sizeof(uint32_t));
 
     // get the registers and the sp
     mp_uint_t regs[8];
     mp_uint_t sp = gc_helper_get_regs_and_sp(regs);
 
     // trace the stack, including the registers (since they live on the stack in this function)
-    gc_collect_root((void**)sp, (stack_end - sp) / sizeof(uint32_t));
+    gc_collect_root((void**)sp, (STACK_END - sp) / sizeof(uint32_t));
+
+    #if MICROPY_EMIT_XTENSA || MICROPY_EMIT_INLINE_XTENSA
+    // trace any native code because it can contain pointers to the heap
+    esp_native_code_gc_collect();
+    #endif
 
     // end the GC
     gc_collect_end();

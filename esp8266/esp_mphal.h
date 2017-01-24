@@ -27,21 +27,74 @@
 #ifndef _INCLUDED_MPHAL_H_
 #define _INCLUDED_MPHAL_H_
 
-void mp_hal_init(void);
-void mp_hal_feed_watchdog(void);
-void mp_hal_udelay(uint32_t);
-int mp_hal_stdin_rx_chr(void);
-void mp_hal_stdout_tx_str(const char *str);
-void mp_hal_stdout_tx_strn(const char *str, uint32_t len);
-void mp_hal_stdout_tx_strn_cooked(const char *str, uint32_t len);
+#include "py/ringbuf.h"
+#include "lib/utils/interrupt_char.h"
+#include "xtirq.h"
 
-uint32_t HAL_GetTick(void);
-void HAL_Delay(uint32_t Delay);
+void mp_keyboard_interrupt(void);
+
+struct _mp_print_t;
+// Structure for UART-only output via mp_printf()
+extern const struct _mp_print_t mp_debug_print;
+
+extern ringbuf_t input_buf;
+// Call this after putting data to input_buf
+void mp_hal_signal_input(void);
+// Call this when data is available in dupterm object
+void mp_hal_signal_dupterm_input(void);
+
+void mp_hal_init(void);
+void mp_hal_rtc_init(void);
+
+uint32_t mp_hal_ticks_us(void);
+__attribute__((always_inline)) static inline uint32_t mp_hal_ticks_cpu(void) {
+  uint32_t ccount;
+  __asm__ __volatile__("rsr %0,ccount":"=a" (ccount));
+  return ccount;
+}
+
+void mp_hal_delay_us(uint32_t);
 void mp_hal_set_interrupt_char(int c);
 uint32_t mp_hal_get_cpu_freq(void);
 
 #define UART_TASK_ID 0
+#define DUPTERM_TASK_ID 1
 void uart_task_init();
+void dupterm_task_init();
 
+void ets_event_poll(void);
+#define ETS_POLL_WHILE(cond) { while (cond) ets_event_poll(); }
+
+// needed for machine.I2C
+#include "osapi.h"
+#define mp_hal_delay_us_fast(us) os_delay_us(us)
+
+#define mp_hal_quiet_timing_enter() disable_irq()
+#define mp_hal_quiet_timing_exit(irq_state) enable_irq(irq_state)
+
+// C-level pin HAL
+#include "etshal.h"
+#include "gpio.h"
+#include "esp8266/modmachine.h"
+#define MP_HAL_PIN_FMT "%u"
+#define mp_hal_pin_obj_t uint32_t
+#define mp_hal_get_pin_obj(o) mp_obj_get_pin(o)
+#define mp_hal_pin_name(p) (p)
+void mp_hal_pin_input(mp_hal_pin_obj_t pin);
+void mp_hal_pin_output(mp_hal_pin_obj_t pin);
+void mp_hal_pin_open_drain(mp_hal_pin_obj_t pin);
+#define mp_hal_pin_od_low(p) do { \
+        if ((p) == 16) { WRITE_PERI_REG(RTC_GPIO_ENABLE, (READ_PERI_REG(RTC_GPIO_ENABLE) & ~1) | 1); } \
+        else { gpio_output_set(0, 1 << (p), 1 << (p), 0); } \
+    } while (0)
+#define mp_hal_pin_od_high(p) do { \
+        if ((p) == 16) { WRITE_PERI_REG(RTC_GPIO_ENABLE, (READ_PERI_REG(RTC_GPIO_ENABLE) & ~1)); } \
+        else { gpio_output_set(1 << (p), 0, 1 << (p), 0); } \
+    } while (0)
+#define mp_hal_pin_read(p) pin_get(p)
+#define mp_hal_pin_write(p, v) pin_set((p), (v))
+
+void *ets_get_esf_buf_ctlblk(void);
+int ets_esf_free_bufs(int idx);
 
 #endif // _INCLUDED_MPHAL_H_

@@ -32,6 +32,7 @@
 #include "py/nlr.h"
 #include "py/compile.h"
 #include "py/objmodule.h"
+#include "py/persistentcode.h"
 #include "py/runtime.h"
 #include "py/builtin.h"
 #include "py/frozenmod.h"
@@ -46,32 +47,51 @@
 
 #define PATH_SEP_CHAR '/'
 
-#if MICROPY_MODULE_WEAK_LINKS
-STATIC const mp_map_elem_t mp_builtin_module_weak_links_table[] = {
-    MICROPY_PORT_BUILTIN_MODULE_WEAK_LINKS
-};
-
-STATIC MP_DEFINE_CONST_MAP(mp_builtin_module_weak_links_map, mp_builtin_module_weak_links_table);
-#endif
-
 bool mp_obj_is_package(mp_obj_t module) {
     mp_obj_t dest[2];
     mp_load_method_maybe(module, MP_QSTR___path__, dest);
     return dest[0] != MP_OBJ_NULL;
 }
 
+// Stat either frozen or normal module by a given path
+// (whatever is available, if at all).
+STATIC mp_import_stat_t mp_import_stat_any(const char *path) {
+    #if MICROPY_MODULE_FROZEN
+    mp_import_stat_t st = mp_frozen_stat(path);
+    if (st != MP_IMPORT_STAT_NO_EXIST) {
+        return st;
+    }
+    #endif
+    return mp_import_stat(path);
+}
+
+STATIC mp_import_stat_t stat_file_py_or_mpy(vstr_t *path) {
+    mp_import_stat_t stat = mp_import_stat_any(vstr_null_terminated_str(path));
+    if (stat == MP_IMPORT_STAT_FILE) {
+        return stat;
+    }
+
+    #if MICROPY_PERSISTENT_CODE_LOAD
+    vstr_ins_byte(path, path->len - 2, 'm');
+    stat = mp_import_stat_any(vstr_null_terminated_str(path));
+    if (stat == MP_IMPORT_STAT_FILE) {
+        return stat;
+    }
+    #endif
+
+    return MP_IMPORT_STAT_NO_EXIST;
+}
+
 STATIC mp_import_stat_t stat_dir_or_file(vstr_t *path) {
-    mp_import_stat_t stat = mp_import_stat(vstr_null_terminated_str(path));
+    mp_import_stat_t stat = mp_import_stat_any(vstr_null_terminated_str(path));
     DEBUG_printf("stat %s: %d\n", vstr_str(path), stat);
     if (stat == MP_IMPORT_STAT_DIR) {
         return stat;
     }
+
+    // not a directory, add .py and try as a file
     vstr_add_str(path, ".py");
-    stat = mp_import_stat(vstr_null_terminated_str(path));
-    if (stat == MP_IMPORT_STAT_FILE) {
-        return stat;
-    }
-    return MP_IMPORT_STAT_NO_EXIST;
+    return stat_file_py_or_mpy(path);
 }
 
 STATIC mp_import_stat_t find_file(const char *file_str, uint file_len, vstr_t *dest) {
@@ -110,12 +130,13 @@ STATIC mp_import_stat_t find_file(const char *file_str, uint file_len, vstr_t *d
 #endif
 }
 
+#if MICROPY_ENABLE_COMPILER
 STATIC void do_load_from_lexer(mp_obj_t module_obj, mp_lexer_t *lex, const char *fname) {
 
     if (lex == NULL) {
         // we verified the file exists using stat, but lexer could still fail
         if (MICROPY_ERROR_REPORTING == MICROPY_ERROR_REPORTING_TERSE) {
-            nlr_raise(mp_obj_new_exception_msg(&mp_type_ImportError, "module not found"));
+            mp_raise_msg(&mp_type_ImportError, "module not found");
         } else {
             nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ImportError,
                 "no module named '%s'", fname));
@@ -131,12 +152,97 @@ STATIC void do_load_from_lexer(mp_obj_t module_obj, mp_lexer_t *lex, const char 
     mp_obj_dict_t *mod_globals = mp_obj_module_get_globals(module_obj);
     mp_parse_compile_execute(lex, MP_PARSE_FILE_INPUT, mod_globals, mod_globals);
 }
+#endif
+
+#if MICROPY_PERSISTENT_CODE_LOAD || MICROPY_MODULE_FROZEN_MPY
+STATIC void do_execute_raw_code(mp_obj_t module_obj, mp_raw_code_t *raw_code) {
+    #if MICROPY_PY___FILE__
+    // TODO
+    //qstr source_name = lex->source_name;
+    //mp_store_attr(module_obj, MP_QSTR___file__, MP_OBJ_NEW_QSTR(source_name));
+    #endif
+
+    // execute the module in its context
+    mp_obj_dict_t *mod_globals = mp_obj_module_get_globals(module_obj);
+
+    // save context
+    mp_obj_dict_t *volatile old_globals = mp_globals_get();
+    mp_obj_dict_t *volatile old_locals = mp_locals_get();
+
+    // set new context
+    mp_globals_set(mod_globals);
+    mp_locals_set(mod_globals);
+
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t module_fun = mp_make_function_from_raw_code(raw_code, MP_OBJ_NULL, MP_OBJ_NULL);
+        mp_call_function_0(module_fun);
+
+        // finish nlr block, restore context
+        nlr_pop();
+        mp_globals_set(old_globals);
+        mp_locals_set(old_locals);
+    } else {
+        // exception; restore context and re-raise same exception
+        mp_globals_set(old_globals);
+        mp_locals_set(old_locals);
+        nlr_jump(nlr.ret_val);
+    }
+}
+#endif
 
 STATIC void do_load(mp_obj_t module_obj, vstr_t *file) {
-    // create the lexer
+    #if MICROPY_MODULE_FROZEN || MICROPY_PERSISTENT_CODE_LOAD || MICROPY_ENABLE_COMPILER
     char *file_str = vstr_null_terminated_str(file);
-    mp_lexer_t *lex = mp_lexer_new_from_file(file_str);
-    do_load_from_lexer(module_obj, lex, file_str);
+    #endif
+
+    // If we support frozen modules (either as str or mpy) then try to find the
+    // requested filename in the list of frozen module filenames.
+    #if MICROPY_MODULE_FROZEN
+    void *modref;
+    int frozen_type = mp_find_frozen_module(file_str, file->len, &modref);
+    #endif
+
+    // If we support frozen str modules and the compiler is enabled, and we
+    // found the filename in the list of frozen files, then load and execute it.
+    #if MICROPY_MODULE_FROZEN_STR
+    if (frozen_type == MP_FROZEN_STR) {
+        do_load_from_lexer(module_obj, modref, file_str);
+        return;
+    }
+    #endif
+
+    // If we support frozen mpy modules and we found a corresponding file (and
+    // its data) in the list of frozen files, execute it.
+    #if MICROPY_MODULE_FROZEN_MPY
+    if (frozen_type == MP_FROZEN_MPY) {
+        do_execute_raw_code(module_obj, modref);
+        return;
+    }
+    #endif
+
+    // If we support loading .mpy files then check if the file extension is of
+    // the correct format and, if so, load and execute the file.
+    #if MICROPY_PERSISTENT_CODE_LOAD
+    if (file_str[file->len - 3] == 'm') {
+        mp_raw_code_t *raw_code = mp_raw_code_load_file(file_str);
+        do_execute_raw_code(module_obj, raw_code);
+        return;
+    }
+    #endif
+
+    // If we can compile scripts then load the file and compile and execute it.
+    #if MICROPY_ENABLE_COMPILER
+    {
+        mp_lexer_t *lex = mp_lexer_new_from_file(file_str);
+        do_load_from_lexer(module_obj, lex, file_str);
+        return;
+    }
+    #endif
+
+    // If we get here then the file was not frozen and we can't compile scripts.
+    nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ImportError,
+        "script compilation not supported"));
 }
 
 STATIC void chop_component(const char *start, const char **end) {
@@ -150,7 +256,7 @@ STATIC void chop_component(const char *start, const char **end) {
     *end = p;
 }
 
-mp_obj_t mp_builtin___import__(mp_uint_t n_args, const mp_obj_t *args) {
+mp_obj_t mp_builtin___import__(size_t n_args, const mp_obj_t *args) {
 #if DEBUG_PRINT
     DEBUG_printf("__import__:\n");
     for (mp_uint_t i = 0; i < n_args; i++) {
@@ -182,9 +288,15 @@ mp_obj_t mp_builtin___import__(mp_uint_t n_args, const mp_obj_t *args) {
         // "Relative imports use a module's __name__ attribute to determine that
         // module's position in the package hierarchy."
         level--;
-        mp_obj_t this_name_q = mp_obj_dict_get(mp_globals_get(), MP_OBJ_NEW_QSTR(MP_QSTR___name__));
+        mp_obj_t this_name_q = mp_obj_dict_get(MP_OBJ_FROM_PTR(mp_globals_get()), MP_OBJ_NEW_QSTR(MP_QSTR___name__));
         assert(this_name_q != MP_OBJ_NULL);
-        mp_map_t *globals_map = mp_obj_dict_get_map(mp_globals_get());
+        #if MICROPY_CPYTHON_COMPAT
+        if (MP_OBJ_QSTR_VALUE(this_name_q) == MP_QSTR___main__) {
+            // This is a module run by -m command-line switch, get its real name from backup attribute
+            this_name_q = mp_obj_dict_get(MP_OBJ_FROM_PTR(mp_globals_get()), MP_OBJ_NEW_QSTR(MP_QSTR___main__));
+        }
+        #endif
+        mp_map_t *globals_map = &mp_globals_get()->map;
         mp_map_elem_t *elem = mp_map_lookup(globals_map, MP_OBJ_NEW_QSTR(MP_QSTR___path__), MP_MAP_LOOKUP);
         bool is_pkg = (elem != NULL);
 
@@ -226,7 +338,7 @@ mp_obj_t mp_builtin___import__(mp_uint_t n_args, const mp_obj_t *args) {
             DEBUG_printf("Warning: no dots in current module name and level>0\n");
             p = this_name + this_name_l;
         } else if (level != -1) {
-            nlr_raise(mp_obj_new_exception_msg(&mp_type_ImportError, "Invalid relative import"));
+            mp_raise_msg(&mp_type_ImportError, "invalid relative import");
         }
 
         uint new_mod_l = (mod_len == 0 ? (size_t)(p - this_name) : (size_t)(p - this_name) + 1 + mod_len);
@@ -238,7 +350,10 @@ mp_obj_t mp_builtin___import__(mp_uint_t n_args, const mp_obj_t *args) {
         }
 
         qstr new_mod_q = qstr_from_strn(new_mod, new_mod_l);
-        DEBUG_printf("Resolved relative name: %s\n", qstr_str(new_mod_q));
+        DEBUG_printf("Resolved base name for relative import: '%s'\n", qstr_str(new_mod_q));
+        if (new_mod_q == MP_QSTR_) {
+            mp_raise_msg(&mp_type_ValueError, "cannot perform relative import");
+        }
         module_name = MP_OBJ_NEW_QSTR(new_mod_q);
         mod_str = new_mod;
         mod_len = new_mod_l;
@@ -263,15 +378,6 @@ mp_obj_t mp_builtin___import__(mp_uint_t n_args, const mp_obj_t *args) {
         return mp_module_get(pkg_name);
     }
     DEBUG_printf("Module not yet loaded\n");
-
-    #if MICROPY_MODULE_FROZEN
-    mp_lexer_t *lex = mp_find_frozen_module(mod_str, mod_len);
-    if (lex != NULL) {
-        module_obj = mp_obj_new_module(module_name_qstr);
-        do_load_from_lexer(module_obj, lex, mod_str);
-        return module_obj;
-    }
-    #endif
 
     uint last = 0;
     VSTR_FIXED(path, MICROPY_ALLOC_PATH_MAX)
@@ -316,10 +422,10 @@ mp_obj_t mp_builtin___import__(mp_uint_t n_args, const mp_obj_t *args) {
                 #endif
                     // couldn't find the file, so fail
                     if (MICROPY_ERROR_REPORTING == MICROPY_ERROR_REPORTING_TERSE) {
-                        nlr_raise(mp_obj_new_exception_msg(&mp_type_ImportError, "module not found"));
+                        mp_raise_msg(&mp_type_ImportError, "module not found");
                     } else {
                         nlr_raise(mp_obj_new_exception_msg_varg(&mp_type_ImportError,
-                            "no module named '%s'", qstr_str(mod_name)));
+                            "no module named '%q'", mod_name));
                     }
                 }
             } else {
@@ -336,8 +442,14 @@ mp_obj_t mp_builtin___import__(mp_uint_t n_args, const mp_obj_t *args) {
                 // this module for command-line "-m" option (set module's
                 // name to __main__ instead of real name).
                 if (i == mod_len && fromtuple == mp_const_false) {
-                    mp_obj_module_t *o = module_obj;
-                    mp_obj_dict_store(o->globals, MP_OBJ_NEW_QSTR(MP_QSTR___name__), MP_OBJ_NEW_QSTR(MP_QSTR___main__));
+                    mp_obj_module_t *o = MP_OBJ_TO_PTR(module_obj);
+                    mp_obj_dict_store(MP_OBJ_FROM_PTR(o->globals), MP_OBJ_NEW_QSTR(MP_QSTR___name__), MP_OBJ_NEW_QSTR(MP_QSTR___main__));
+                    #if MICROPY_CPYTHON_COMPAT
+                    // Store module as "__main__" in the dictionary of loaded modules (returned by sys.modules).
+                    mp_obj_dict_store(MP_OBJ_FROM_PTR(&MP_STATE_VM(mp_loaded_modules_dict)), MP_OBJ_NEW_QSTR(MP_QSTR___main__), module_obj);
+                    // Store real name in "__main__" attribute. Choosen semi-randonly, to reuse existing qstr's.
+                    mp_obj_dict_store(MP_OBJ_FROM_PTR(o->globals), MP_OBJ_NEW_QSTR(MP_QSTR___main__), MP_OBJ_NEW_QSTR(mod_name));
+                    #endif
                 }
 
                 if (stat == MP_IMPORT_STAT_DIR) {
@@ -345,21 +457,21 @@ mp_obj_t mp_builtin___import__(mp_uint_t n_args, const mp_obj_t *args) {
                     // https://docs.python.org/3/reference/import.html
                     // "Specifically, any module that contains a __path__ attribute is considered a package."
                     mp_store_attr(module_obj, MP_QSTR___path__, mp_obj_new_str(vstr_str(&path), vstr_len(&path), false));
+                    size_t orig_path_len = path.len;
                     vstr_add_char(&path, PATH_SEP_CHAR);
                     vstr_add_str(&path, "__init__.py");
-                    if (mp_import_stat(vstr_null_terminated_str(&path)) != MP_IMPORT_STAT_FILE) {
-                        vstr_cut_tail_bytes(&path, sizeof("/__init__.py") - 1); // cut off /__init__.py
-                        mp_warning("%s is imported as namespace package", vstr_str(&path));
+                    if (stat_file_py_or_mpy(&path) != MP_IMPORT_STAT_FILE) {
+                        //mp_warning("%s is imported as namespace package", vstr_str(&path));
                     } else {
                         do_load(module_obj, &path);
-                        vstr_cut_tail_bytes(&path, sizeof("/__init__.py") - 1); // cut off /__init__.py
                     }
+                    path.len = orig_path_len;
                 } else { // MP_IMPORT_STAT_FILE
                     do_load(module_obj, &path);
-                    // TODO: We cannot just break here, at the very least, we must execute
-                    // trailer code below. But otherwise if there're remaining components,
-                    // that would be (??) object path within module, not modules path within FS.
-                    // break;
+                    // This should be the last component in the import path.  If there are
+                    // remaining components then it's an ImportError because the current path
+                    // (the module that was just loaded) is not a package.  This will be caught
+                    // on the next iteration because the file will not exist.
                 }
             }
             if (outer_module_obj != MP_OBJ_NULL) {
@@ -372,12 +484,6 @@ mp_obj_t mp_builtin___import__(mp_uint_t n_args, const mp_obj_t *args) {
             }
             last = i + 1;
         }
-    }
-
-    if (i < mod_len) {
-        // we loaded a package, now need to load objects from within that package
-        // TODO
-        assert(0);
     }
 
     // If fromlist is not empty, return leaf module
